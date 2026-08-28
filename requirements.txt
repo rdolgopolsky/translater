@@ -1,0 +1,9 @@
+anthropic
+customtkinter
+google-genai
+keyboard
+pyautogui
+pyperclip
+pynput
+pywin32
+pyinstaller
