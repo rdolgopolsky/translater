@@ -43,7 +43,37 @@ API_KEY = ""
 client = None
 ANTHROPIC_API_KEY = ""
 claude_client = None
-CLAUDE_MODEL = "claude-haiku-4-5"
+GEMINI_ALLOWED_MODELS = (
+    "gemini-flash-lite-latest",
+    "gemini-flash-latest",
+    "gemini-pro-latest",
+)
+GEMINI_MODEL = GEMINI_ALLOWED_MODELS[0]
+CLAUDE_ALLOWED_MODELS = (
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-5-20250929",
+)
+CLAUDE_MODEL = CLAUDE_ALLOWED_MODELS[0]
+MODEL_DESCRIPTIONS = {}
+MODEL_PRICES = {
+    "gemini-2.5-flash": "$0.30 / $2.50 за 1M токенів",
+    "gemini-2.5-pro": "$1.25 / $10.00 за 1M токенів",
+    "claude-haiku-4-5-20251001": "$1.00 / $5.00 за 1M токенів",
+    "claude-sonnet-4-5-20250929": "$3.00 / $15.00 за 1M токенів",
+    "claude-opus-4-1": "$15.00 / $75.00 за 1M токенів",
+}
+MODEL_RATES = {
+    "gemini-2.5-flash": (0.30, 2.50),
+    "gemini-2.5-pro": (1.25, 10.00),
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "claude-sonnet-4-5-20250929": (3.00, 15.00),
+    "claude-opus-4-1": (15.00, 75.00),
+}
+USAGE_TOTALS = {
+    "Gemini": {"input": 0, "output": 0, "cost": 0.0},
+    "Claude": {"input": 0, "output": 0, "cost": 0.0},
+}
+usage_lock = threading.Lock()
 CLAUDE_INPUT_PRICE_PER_MILLION = 1.0
 CLAUDE_OUTPUT_PRICE_PER_MILLION = 5.0
 gemini_cooldown_until = 0
@@ -61,6 +91,35 @@ def get_gemini_cooldown_seconds(error_text):
         except Exception:
             return 24 * 60 * 60
     return GEMINI_COOLDOWN_SECONDS
+
+def record_usage(provider, model, input_tokens, output_tokens):
+    rates = MODEL_RATES.get(model)
+    with usage_lock:
+        totals = USAGE_TOTALS[provider]
+        totals["input"] += input_tokens
+        totals["output"] += output_tokens
+        if rates:
+            input_rate, output_rate = rates
+            request_cost = (
+                input_tokens * input_rate + output_tokens * output_rate
+            ) / 1_000_000
+            totals["cost"] += request_cost
+        else:
+            request_cost = None
+        total_tokens = input_tokens + output_tokens
+        session_tokens = totals["input"] + totals["output"]
+
+    if request_cost is None:
+        log_debug(
+            f"{provider}: токени: {input_tokens} вхідних + {output_tokens} вихідних = "
+            f"{total_tokens}; ціна поки невідома для {model}; за сесію {session_tokens} токенів"
+        )
+    else:
+        log_debug(
+            f"{provider}: токени: {input_tokens} вхідних + {output_tokens} вихідних = "
+            f"{total_tokens}; цей запит приблизно ${request_cost:.6f}; "
+            f"за сесію приблизно ${totals['cost']:.6f}"
+        )
 
 if sys.platform.startswith("win"):
     try:
@@ -131,6 +190,14 @@ HOTKEY_REPLACE = saved_replace_hotkey if isinstance(saved_replace_hotkey, str) a
 HOTKEY_POPUP = saved_popup_hotkey if isinstance(saved_popup_hotkey, str) and saved_popup_hotkey.strip() else "ctrl+w"
 gemini_enabled = saved_settings.get("gemini_enabled", True) is not False
 claude_enabled = saved_settings.get("claude_enabled", True) is not False
+saved_gemini_model = saved_settings.get("gemini_model", GEMINI_MODEL)
+if not isinstance(saved_gemini_model, str) or saved_gemini_model not in GEMINI_ALLOWED_MODELS:
+    saved_gemini_model = GEMINI_MODEL
+GEMINI_MODEL = saved_gemini_model.strip() or GEMINI_MODEL
+saved_claude_model = saved_settings.get("claude_model", CLAUDE_MODEL)
+if not isinstance(saved_claude_model, str) or saved_claude_model not in CLAUDE_ALLOWED_MODELS:
+    saved_claude_model = CLAUDE_MODEL
+CLAUDE_MODEL = saved_claude_model.strip() or CLAUDE_MODEL
 saved_gemini_api_key = unprotect_secret(saved_settings.get("gemini_api_key", ""))
 saved_claude_api_key = unprotect_secret(saved_settings.get("claude_api_key", ""))
 
@@ -145,7 +212,10 @@ UI_TEXT = {
         "main_language": "Основна мова:", "translate_language": "Мова перекладу:",
         "context": "Контекст розмови (необов'язково):", "status": "Виділіть текст і скористайтеся гарячою клавішею",
         "debug": "Відкрити дебаг", "api_settings": "Налаштування API", "gemini_key": "Ключ Gemini API:",
-        "claude_key": "Ключ Claude API:", "save": "Зберегти", "debug_title": "Дебаг перекладача",
+        "gemini_model": "Модель Gemini:", "claude_key": "Ключ Claude API:", "claude_model": "Модель Claude:",
+        "refresh_models": "Оновити моделі", "models_loading": "Завантаження моделей...",
+        "model_price_unknown": "Ціна не визначена API",
+        "save": "Зберегти", "debug_title": "Дебаг перекладача",
         "clear": "Очистити", "close": "Закрити", "choose_action": "Виберіть дію:",
         "translate": "🌐 Перекласти", "replace": "✍️ Замінити текст", "fix": "📝 Виправити помилки",
         "copy": "Копіювати", "loading": "⏳ Завантаження...", "processing": "⏳ Обробка...",
@@ -163,7 +233,10 @@ UI_TEXT = {
         "main_language": "Основной язык:", "translate_language": "Язык перевода:",
         "context": "Контекст разговора (необязательно):", "status": "Выделите текст и используйте горячую клавишу",
         "debug": "Открыть отладку", "api_settings": "Настройки API", "gemini_key": "Ключ Gemini API:",
-        "claude_key": "Ключ Claude API:", "save": "Сохранить", "debug_title": "Отладка переводчика",
+        "gemini_model": "Модель Gemini:", "claude_key": "Ключ Claude API:", "claude_model": "Модель Claude:",
+        "refresh_models": "Обновить модели", "models_loading": "Загрузка моделей...",
+        "model_price_unknown": "Цена не указана API",
+        "save": "Сохранить", "debug_title": "Отладка переводчика",
         "clear": "Очистить", "close": "Закрыть", "choose_action": "Выберите действие:",
         "translate": "🌐 Перевести", "replace": "✍️ Заменить текст", "fix": "📝 Исправить ошибки",
         "copy": "Копировать", "loading": "⏳ Загрузка...", "processing": "⏳ Обработка...",
@@ -181,7 +254,10 @@ UI_TEXT = {
         "main_language": "Main language:", "translate_language": "Translation language:",
         "context": "Conversation context (optional):", "status": "Select text and use a hotkey",
         "debug": "Open debug", "api_settings": "API settings", "gemini_key": "Gemini API key:",
-        "claude_key": "Claude API key:", "save": "Save", "debug_title": "Translator debug",
+        "gemini_model": "Gemini model:", "claude_key": "Claude API key:", "claude_model": "Claude model:",
+        "refresh_models": "Refresh models", "models_loading": "Loading models...",
+        "model_price_unknown": "Price is not provided by API",
+        "save": "Save", "debug_title": "Translator debug",
         "clear": "Clear", "close": "Close", "choose_action": "Choose an action:",
         "translate": "🌐 Translate", "replace": "✍️ Replace text", "fix": "📝 Fix mistakes",
         "copy": "Copy", "loading": "⏳ Loading...", "processing": "⏳ Processing...",
@@ -310,6 +386,8 @@ def save_settings():
         "context": conversation_context_box.get("1.0", "end-1c"),
         "gemini_api_key": protect_secret(API_KEY),
         "claude_api_key": protect_secret(ANTHROPIC_API_KEY),
+        "gemini_model": GEMINI_MODEL,
+        "claude_model": CLAUDE_MODEL,
         "gemini_enabled": gemini_enabled,
         "claude_enabled": claude_enabled,
         "replace_hotkey": HOTKEY_REPLACE,
@@ -356,42 +434,151 @@ def apply_interface_language(current_base_language=None):
     popup_hotkey_info.configure(text=tr("popup_hotkey_info"))
     debug_button.configure(text=tr("debug"))
 
+def model_price(model_name):
+    return MODEL_PRICES.get(model_name, tr("model_price_unknown"))
+
+def fetch_model_catalog():
+    catalog = {"gemini": {}, "claude": {}}
+    if client:
+        try:
+            for model in client.models.list(config={"page_size": 100}):
+                model_name = getattr(model, "name", "").removeprefix("models/")
+                supported_actions = getattr(model, "supported_actions", []) or []
+                excluded_model_terms = (
+                    "-tts", "-image", "embedding", "aqa", "robotics",
+                    "computer-use", "transcribe", "customtools",
+                )
+                if (
+                    model_name.startswith("gemini-")
+                    and "generateContent" in supported_actions
+                    and not any(term in model_name.lower() for term in excluded_model_terms)
+                    and model_name in GEMINI_ALLOWED_MODELS
+                ):
+                    catalog["gemini"][model_name] = getattr(model, "description", "") or ""
+        except Exception as error:
+            log_debug(f"Моделі Gemini: помилка: {str(error)[:200]}")
+    if claude_client:
+        try:
+            for model in claude_client.models.list(limit=100):
+                model_name = getattr(model, "id", "")
+                if model_name in CLAUDE_ALLOWED_MODELS:
+                    catalog["claude"][model_name] = getattr(model, "display_name", "") or ""
+        except Exception as error:
+            log_debug(f"Моделі Claude: помилка: {str(error)[:200]}")
+    return catalog
+
+def model_info_text(provider, model_name):
+    description = MODEL_DESCRIPTIONS.get(provider, {}).get(model_name, "")
+    price = model_price(model_name)
+    return f"{description}\n{price}" if description else price
+
 def show_api_settings():
+    global MODEL_DESCRIPTIONS
     api_window = ctk.CTkToplevel(app)
     api_window.title(tr("api_settings"))
-    api_window.geometry("390x280")
+    api_window.geometry("430x500")
     api_window.attributes("-topmost", True)
 
-    ctk.CTkLabel(api_window, text=tr("gemini_key"), anchor="w").pack(fill="x", padx=15, pady=(12, 2))
-    gemini_entry = ctk.CTkEntry(api_window, width=350, show="*")
-    gemini_entry.insert(0, API_KEY)
-    gemini_entry.pack(padx=15, pady=(0, 8))
-
     gemini_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("gemini_enabled"))
-    gemini_enabled_checkbox.pack(anchor="w", padx=15, pady=(0, 10))
-    if gemini_enabled:
-        gemini_enabled_checkbox.select()
+    gemini_enabled_checkbox.pack(anchor="w", padx=15, pady=(12, 6))
 
-    ctk.CTkLabel(api_window, text=tr("claude_key"), anchor="w").pack(fill="x", padx=15, pady=(0, 2))
-    claude_entry = ctk.CTkEntry(api_window, width=350, show="*")
-    claude_entry.insert(0, ANTHROPIC_API_KEY)
-    claude_entry.pack(padx=15, pady=(0, 10))
+    gemini_fields = ctk.CTkFrame(api_window, fg_color="transparent")
+    ctk.CTkLabel(gemini_fields, text=tr("gemini_key"), anchor="w").pack(fill="x", pady=(0, 2))
+    gemini_entry = ctk.CTkEntry(gemini_fields, height=30, show="*")
+    gemini_entry.insert(0, API_KEY)
+    gemini_entry.pack(fill="x", pady=(0, 8))
+    ctk.CTkLabel(gemini_fields, text=tr("gemini_model"), anchor="w").pack(fill="x", pady=(0, 2))
+    gemini_model_select = ctk.CTkOptionMenu(gemini_fields, values=[GEMINI_MODEL], height=30)
+    gemini_model_select.set(GEMINI_MODEL)
+    gemini_model_select.pack(fill="x", pady=(0, 2))
+    gemini_model_info = ctk.CTkLabel(gemini_fields, text=model_info_text("gemini", GEMINI_MODEL), anchor="w", justify="left", wraplength=390)
+    gemini_model_info.pack(fill="x", pady=(0, 8))
 
     claude_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("claude_enabled"))
-    claude_enabled_checkbox.pack(anchor="w", padx=15, pady=(0, 10))
+
+    claude_fields = ctk.CTkFrame(api_window, fg_color="transparent")
+    ctk.CTkLabel(claude_fields, text=tr("claude_key"), anchor="w").pack(fill="x", pady=(0, 2))
+    claude_entry = ctk.CTkEntry(claude_fields, height=30, show="*")
+    claude_entry.insert(0, ANTHROPIC_API_KEY)
+    claude_entry.pack(fill="x", pady=(0, 8))
+    ctk.CTkLabel(claude_fields, text=tr("claude_model"), anchor="w").pack(fill="x", pady=(0, 2))
+    claude_model_select = ctk.CTkOptionMenu(claude_fields, values=[CLAUDE_MODEL], height=30)
+    claude_model_select.set(CLAUDE_MODEL)
+    claude_model_select.pack(fill="x", pady=(0, 2))
+    claude_model_info = ctk.CTkLabel(claude_fields, text=model_info_text("claude", CLAUDE_MODEL), anchor="w", justify="left", wraplength=390)
+    claude_model_info.pack(fill="x", pady=(0, 8))
+
+    if gemini_enabled:
+        gemini_enabled_checkbox.select()
+        gemini_fields.pack(fill="x", padx=15)
+    claude_enabled_checkbox.pack(anchor="w", padx=15, pady=(6, 6))
     if claude_enabled:
         claude_enabled_checkbox.select()
+        claude_fields.pack(fill="x", padx=15)
+
+    def toggle_provider(checkbox, fields, before_widget=None):
+        if checkbox.get():
+            pack_options = {"fill": "x", "padx": 15}
+            if before_widget:
+                pack_options["before"] = before_widget
+            fields.pack(**pack_options)
+        else:
+            fields.pack_forget()
+
+    gemini_enabled_checkbox.configure(command=lambda: toggle_provider(gemini_enabled_checkbox, gemini_fields, claude_enabled_checkbox))
+    claude_enabled_checkbox.configure(command=lambda: toggle_provider(claude_enabled_checkbox, claude_fields, refresh_button))
+
+    def update_model_info(provider, selector, info_label, _selected_model=None):
+        info_label.configure(text=model_info_text(provider, selector.get()))
+
+    gemini_model_select.configure(command=lambda selected: update_model_info("gemini", gemini_model_select, gemini_model_info, selected))
+    claude_model_select.configure(command=lambda selected: update_model_info("claude", claude_model_select, claude_model_info, selected))
+
+    def apply_model_catalog(catalog):
+        global MODEL_DESCRIPTIONS
+        MODEL_DESCRIPTIONS = catalog
+        gemini_models = [model for model in GEMINI_ALLOWED_MODELS if model in catalog["gemini"]]
+        if not gemini_models:
+            gemini_models = [GEMINI_MODEL]
+        claude_models = [model for model in CLAUDE_ALLOWED_MODELS if model in catalog["claude"]]
+        if not claude_models:
+            claude_models = [CLAUDE_MODEL]
+        selected_gemini_model = GEMINI_MODEL if GEMINI_MODEL in gemini_models else (
+            "gemini-flash-latest" if "gemini-flash-latest" in gemini_models else gemini_models[0]
+        )
+        selected_claude_model = CLAUDE_MODEL if CLAUDE_MODEL in claude_models else claude_models[0]
+        gemini_model_select.configure(values=gemini_models)
+        claude_model_select.configure(values=claude_models)
+        gemini_model_select.set(selected_gemini_model)
+        claude_model_select.set(selected_claude_model)
+        gemini_model_info.configure(text=model_info_text("gemini", selected_gemini_model))
+        claude_model_info.configure(text=model_info_text("claude", selected_claude_model))
+        refresh_button.configure(text=tr("refresh_models"), state="normal")
+
+    def refresh_models():
+        refresh_button.configure(text=tr("models_loading"), state="disabled")
+        def worker():
+            catalog = fetch_model_catalog()
+            if api_window.winfo_exists():
+                api_window.after(0, lambda: apply_model_catalog(catalog))
+        threading.Thread(target=worker, daemon=True).start()
+
+    refresh_button = ctk.CTkButton(api_window, text=tr("refresh_models"), width=150, height=26, command=refresh_models)
+    refresh_button.pack(pady=(0, 8))
 
     def save_api_settings():
-        global gemini_enabled, claude_enabled
+        global gemini_enabled, claude_enabled, GEMINI_MODEL, CLAUDE_MODEL
         gemini_enabled = bool(gemini_enabled_checkbox.get())
         claude_enabled = bool(claude_enabled_checkbox.get())
+        GEMINI_MODEL = gemini_model_select.get().strip() or GEMINI_MODEL
+        CLAUDE_MODEL = claude_model_select.get().strip() or CLAUDE_MODEL
         configure_api_clients(gemini_entry.get(), claude_entry.get())
         save_settings()
         destroy_toplevel(api_window)
 
     ctk.CTkButton(api_window, text=tr("save"), width=110, height=26, command=save_api_settings).pack()
     api_window.protocol("WM_DELETE_WINDOW", lambda: destroy_toplevel(api_window))
+    refresh_models()
 
 base_lang_select.configure(command=select_base_language)
 conversation_context_box.bind("<KeyRelease>", lambda _: save_settings())
@@ -527,7 +714,8 @@ def run_claude_action(prompt: str) -> str:
         strict_prompt = (
             f"{prompt}\n\n"
             "Output exactly one best answer only. Never provide alternatives, synonyms, "
-            "options, explanations, or the word 'or'. Keep the answer on one line."
+            "options, explanations, or the word 'or'. Preserve the original line breaks, "
+            "paragraphs, lists, and formatting."
         )
         response = claude_client.messages.create(
             model=CLAUDE_MODEL,
@@ -539,14 +727,7 @@ def run_claude_action(prompt: str) -> str:
         if usage:
             input_tokens = getattr(usage, "input_tokens", 0)
             output_tokens = getattr(usage, "output_tokens", 0)
-            estimated_cost = (
-                input_tokens * CLAUDE_INPUT_PRICE_PER_MILLION
-                + output_tokens * CLAUDE_OUTPUT_PRICE_PER_MILLION
-            ) / 1_000_000
-            log_debug(
-                f"Claude: токени: {input_tokens} вхідних + {output_tokens} вихідних = "
-                f"{input_tokens + output_tokens}; приблизно ${estimated_cost:.6f}"
-            )
+            record_usage("Claude", CLAUDE_MODEL, input_tokens, output_tokens)
         log_debug(f"Claude: отримано відповідь: {result[:120]!r}")
         return result
     except Exception as e:
@@ -594,23 +775,31 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
         prompt = f"{context_instruction}Translate to {target_lang}:\n{text}"
 
     if client is None:
-        log_debug("API: GEMINI_API_KEY is not set")
+        if not gemini_enabled:
+            log_debug("API: Gemini вимкнений у налаштуваннях, до запиту обрано Claude")
+        else:
+            log_debug("API: GEMINI_API_KEY is not set, до запиту обрано Claude")
+        if claude_client:
+            return run_claude_action(prompt)
         return tr("fix_api_missing" if action_type == "fix" else "api_missing")
 
     if time.time() < gemini_cooldown_until:
         remaining_seconds = int(gemini_cooldown_until - time.time())
         log_debug(f"API: Gemini пропущено, cooldown ще {remaining_seconds} с")
+        if claude_client:
+            log_debug("API: Gemini на cooldown, перемикаюся на Claude Haiku")
+            return run_claude_action(prompt)
         return tr("gemini_cooldown")
 
     try:
         config = {
             "temperature": 0.0,
             "max_output_tokens": 600,
-            "thinking_config": {
-                "thinking_budget": 0,
-            },
         }
-        chat = client.chats.create(model="gemini-3.6-flash")
+        if "lite" not in GEMINI_MODEL.lower():
+            config["thinking_config"] = {"thinking_budget": 0}
+        log_debug(f"Gemini: запит до моделі {GEMINI_MODEL}")
+        chat = client.chats.create(model=GEMINI_MODEL)
         response = chat.send_message(
             prompt,
             config=config
@@ -625,11 +814,7 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
         if usage:
             prompt_tokens = getattr(usage, "prompt_token_count", 0)
             output_tokens = getattr(usage, "candidates_token_count", 0)
-            total_tokens = getattr(usage, "total_token_count", prompt_tokens + output_tokens)
-            log_debug(
-                f"Gemini: токени: {prompt_tokens} вхідних + {output_tokens} вихідних = "
-                f"{total_tokens}; приблизно $0.00 у межах free tier"
-            )
+            record_usage("Gemini", GEMINI_MODEL, prompt_tokens, output_tokens)
         return result
     except Exception as e:
         error_text = str(e)
