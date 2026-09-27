@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import base64
 import time
 from datetime import datetime, timedelta
 import threading
@@ -13,6 +14,7 @@ import customtkinter as ctk
 from pynput import mouse
 from google import genai
 from anthropic import Anthropic
+import win32crypt
 import win32gui
 import win32process
 
@@ -89,6 +91,30 @@ SETTINGS_FILE = os.path.join(
     os.getenv("APPDATA", os.path.expanduser("~")),
     "translator_settings.json"
 )
+SECRET_PREFIX = "dpapi:"
+
+def protect_secret(value):
+    if not value:
+        return ""
+    try:
+        encrypted = win32crypt.CryptProtectData(
+            value.encode("utf-8"), "Translator API key", None, None, None, 0
+        )
+        return SECRET_PREFIX + base64.b64encode(encrypted).decode("ascii")
+    except Exception:
+        return value
+
+def unprotect_secret(value):
+    if not isinstance(value, str) or not value:
+        return ""
+    if not value.startswith(SECRET_PREFIX):
+        return value
+    try:
+        encrypted = base64.b64decode(value[len(SECRET_PREFIX):])
+        decrypted = win32crypt.CryptUnprotectData(encrypted, None, None, None, 0)[1]
+        return decrypted.decode("utf-8")
+    except Exception:
+        return ""
 
 def load_settings():
     try:
@@ -105,6 +131,8 @@ HOTKEY_REPLACE = saved_replace_hotkey if isinstance(saved_replace_hotkey, str) a
 HOTKEY_POPUP = saved_popup_hotkey if isinstance(saved_popup_hotkey, str) and saved_popup_hotkey.strip() else "ctrl+w"
 gemini_enabled = saved_settings.get("gemini_enabled", True) is not False
 claude_enabled = saved_settings.get("claude_enabled", True) is not False
+saved_gemini_api_key = unprotect_secret(saved_settings.get("gemini_api_key", ""))
+saved_claude_api_key = unprotect_secret(saved_settings.get("claude_api_key", ""))
 
 UI_LANGUAGES = {
     "uk": "Українська",
@@ -122,6 +150,7 @@ UI_TEXT = {
         "translate": "🌐 Перекласти", "replace": "✍️ Замінити текст", "fix": "📝 Виправити помилки",
         "copy": "Копіювати", "loading": "⏳ Завантаження...", "processing": "⏳ Обробка...",
         "no_text": "Текст не знайдено", "api_missing": "Немає доступного сервісу перекладу.",
+        "busy": "Попередній запит ще виконується.",
         "fix_api_missing": "Для виправлення тексту задайте ключ Gemini або Claude API.",
         "gemini_cooldown": "Gemini тимчасово недоступний через ліміт запитів.",
         "replace_hotkey": "Заміна тексту:", "popup_hotkey": "Показ перекладу:",
@@ -139,6 +168,7 @@ UI_TEXT = {
         "translate": "🌐 Перевести", "replace": "✍️ Заменить текст", "fix": "📝 Исправить ошибки",
         "copy": "Копировать", "loading": "⏳ Загрузка...", "processing": "⏳ Обработка...",
         "no_text": "Текст не найден", "api_missing": "Нет доступного сервиса перевода.",
+        "busy": "Предыдущий запрос ещё выполняется.",
         "fix_api_missing": "Для исправления текста укажите ключ Gemini или Claude API.",
         "gemini_cooldown": "Gemini временно недоступен из-за лимита запросов.",
         "replace_hotkey": "Замена текста:", "popup_hotkey": "Показ перевода:",
@@ -156,6 +186,7 @@ UI_TEXT = {
         "translate": "🌐 Translate", "replace": "✍️ Replace text", "fix": "📝 Fix mistakes",
         "copy": "Copy", "loading": "⏳ Loading...", "processing": "⏳ Processing...",
         "no_text": "Text not found", "api_missing": "No translation service is available.",
+        "busy": "The previous request is still running.",
         "fix_api_missing": "Set a Gemini or Claude API key to correct text.",
         "gemini_cooldown": "Gemini is temporarily unavailable because of the request limit.",
         "replace_hotkey": "Replace text:", "popup_hotkey": "Show translation:",
@@ -187,8 +218,8 @@ def configure_api_clients(gemini_key, claude_key):
     claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY and claude_enabled else None
 
 configure_api_clients(
-    saved_settings.get("gemini_api_key", os.getenv("GEMINI_API_KEY", "")),
-    saved_settings.get("claude_api_key", os.getenv("ANTHROPIC_API_KEY", ""))
+    saved_gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
+    saved_claude_api_key or os.getenv("ANTHROPIC_API_KEY", "")
 )
 
 # --- 3. UI НАЛАШТУВАННЯ ---
@@ -277,8 +308,8 @@ def save_settings():
         "base_language": base_language,
         "target_language": target_language,
         "context": conversation_context_box.get("1.0", "end-1c"),
-        "gemini_api_key": API_KEY,
-        "claude_api_key": ANTHROPIC_API_KEY,
+        "gemini_api_key": protect_secret(API_KEY),
+        "claude_api_key": protect_secret(ANTHROPIC_API_KEY),
         "gemini_enabled": gemini_enabled,
         "claude_enabled": claude_enabled,
         "replace_hotkey": HOTKEY_REPLACE,
@@ -461,12 +492,18 @@ debug_button.pack(before=status_lbl, pady=(10, 14))
 
 # --- 4. API & ФУНКЦІЇ ПЕРЕКЛАДУ ---
 def normalize_model_result(result: str) -> str:
-    lines = [line.strip() for line in result.strip().splitlines() if line.strip()]
+    normalized_result = result.strip()
+    if not normalized_result:
+        return ""
+    lines = normalized_result.splitlines()
+    if lines and lines[0].strip().startswith("```") and lines[-1].strip() == "```":
+        normalized_result = "\n".join(lines[1:-1]).strip()
+        lines = normalized_result.splitlines()
     alternative_markers = {"or", "або", "или"}
     for index, line in enumerate(lines):
-        if index > 0 and line.lower() in alternative_markers:
-            return lines[index - 1]
-    return " ".join(lines)
+        if index > 0 and line.strip().lower() in alternative_markers:
+            return "\n".join(lines[:index]).strip()
+    return normalized_result
 
 
 def looks_like_translation_instructions(result: str) -> bool:
@@ -645,6 +682,7 @@ class AssistantBubble:
         self.result_popup = None
         self.loading_indicator = None
         self.loading_animation_job = None
+        self.request_lock = threading.Lock()
         self.cached_text = ""
         self.last_target_hwnd = None
 
@@ -836,8 +874,12 @@ class AssistantBubble:
             )
 
     def execute_popup_action(self, action_type="translate", text=None):
+        if not self.request_lock.acquire(blocking=False):
+            log_debug(tr("busy"))
+            return
         raw_text = text or grab_selected_text_direct()
         if not raw_text:
+            self.request_lock.release()
             log_debug(tr("no_text"))
             return
 
@@ -846,17 +888,24 @@ class AssistantBubble:
         
         self.show_result_popup(tr("processing"))
         def worker():
-            target = target_language
-            res = run_gemini_action(raw_text, action_type, target, context)
-            pyperclip.copy(res)
-            log_debug("Вікно перекладу: результат скопійовано в буфер")
-            self.master.after(0, lambda: self.update_result_text(res))
+            try:
+                target = target_language
+                res = run_gemini_action(raw_text, action_type, target, context)
+                pyperclip.copy(res)
+                log_debug("Вікно перекладу: результат скопійовано в буфер")
+                self.master.after(0, lambda: self.update_result_text(res))
+            finally:
+                self.request_lock.release()
         threading.Thread(target=worker, daemon=True).start()
 
     def execute_replace_action(self, action_type="translate", text=None, target_hwnd=None):
+        if not self.request_lock.acquire(blocking=False):
+            log_debug(tr("busy"))
+            return
         self.show_loading_indicator()
         raw_text = text or grab_selected_text_direct()
         if not raw_text:
+            self.request_lock.release()
             self.hide_loading_indicator()
             log_debug(tr("no_text"))
             return
@@ -881,6 +930,7 @@ class AssistantBubble:
                 log_debug("Заміна: результат вставлено")
             finally:
                 self.hide_loading_indicator()
+                self.request_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
