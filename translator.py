@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import threading
 import ctypes
 from ctypes import wintypes
-import keyboard
 import pyperclip
 import pyautogui
 import customtkinter as ctk
@@ -585,7 +584,7 @@ conversation_context_box.bind("<KeyRelease>", lambda _: save_settings())
 
 def close_app():
     save_settings()
-    keyboard.unhook_all_hotkeys()
+    stop_global_hotkeys()
     app.destroy()
 
 app.protocol("WM_DELETE_WINDOW", close_app)
@@ -1076,8 +1075,6 @@ class AssistantBubble:
             try:
                 target = target_language
                 res = run_gemini_action(raw_text, action_type, target, context)
-                pyperclip.copy(res)
-                log_debug("Вікно перекладу: результат скопійовано в буфер")
                 self.master.after(0, lambda: self.update_result_text(res))
             finally:
                 self.request_lock.release()
@@ -1087,14 +1084,13 @@ class AssistantBubble:
         if not self.request_lock.acquire(blocking=False):
             log_debug(tr("busy"))
             return
-        self.show_loading_indicator()
         raw_text = text or grab_selected_text_direct()
         if not raw_text:
             self.request_lock.release()
-            self.hide_loading_indicator()
             log_debug(tr("no_text"))
             return
 
+        self.show_loading_indicator()
         log_debug("Заміна: команда Ctrl+Q спрацювала")
         context = conversation_context_box.get("1.0", "end-1c").strip()
 
@@ -1122,27 +1118,87 @@ class AssistantBubble:
 bubble_manager = AssistantBubble(app)
 
 # --- 6. РЕЄСТРАЦІЯ ШОРТКАТІВ ---
-def rebind_shortcuts():
-    try:
-        keyboard.unhook_all_hotkeys()
-    except:
-        pass
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+HOTKEY_ID_REPLACE = 1
+HOTKEY_ID_POPUP = 2
+hotkey_thread = None
+hotkey_thread_id = None
+hotkey_stop_event = threading.Event()
 
+def parse_hotkey(hotkey):
+    modifiers = 0
+    key_name = ""
+    modifier_flags = {
+        "alt": MOD_ALT,
+        "ctrl": MOD_CONTROL,
+        "control": MOD_CONTROL,
+        "shift": MOD_SHIFT,
+        "win": MOD_WIN,
+        "windows": MOD_WIN,
+    }
+    for part in hotkey.lower().replace(" ", "").split("+"):
+        if part in modifier_flags:
+            modifiers |= modifier_flags[part]
+        else:
+            key_name = part
+    if len(key_name) != 1:
+        raise ValueError(f"Непідтримувана клавіша в хоткеї: {hotkey}")
+    vk_key_scan = ctypes.windll.user32.VkKeyScanW
+    vk_key_scan.argtypes = [ctypes.c_wchar]
+    vk_key_scan.restype = ctypes.c_short
+    virtual_key = vk_key_scan(key_name.upper()) & 0xFF
+    if virtual_key == 0xFF:
+        raise ValueError(f"Невідома клавіша в хоткеї: {hotkey}")
+    return modifiers, virtual_key
+
+def global_hotkey_loop():
+    global hotkey_thread_id
+    hotkey_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+    registrations = []
     try:
-        keyboard.add_hotkey(
-            HOTKEY_REPLACE,
-            lambda: bubble_manager.execute_replace_action("translate"),
-            suppress=True,
-            trigger_on_release=True
-        )
-        keyboard.add_hotkey(
-            HOTKEY_POPUP,
-            lambda: bubble_manager.execute_popup_action("translate"),
-            suppress=True,
-            trigger_on_release=True
-        )
-    except Exception as e:
-        log_debug(f"Hotkeys: помилка реєстрації: {e}")
+        for hotkey_id, hotkey in (
+            (HOTKEY_ID_REPLACE, HOTKEY_REPLACE),
+            (HOTKEY_ID_POPUP, HOTKEY_POPUP),
+        ):
+            modifiers, virtual_key = parse_hotkey(hotkey)
+            if not ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
+                raise RuntimeError(f"Не вдалося зареєструвати {hotkey}")
+            registrations.append(hotkey_id)
+
+        message = wintypes.MSG()
+        while not hotkey_stop_event.is_set():
+            result = ctypes.windll.user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+            if result <= 0:
+                break
+            if message.message == WM_HOTKEY:
+                if message.wParam == HOTKEY_ID_REPLACE:
+                    app.after(0, lambda: bubble_manager.execute_replace_action("translate"))
+                elif message.wParam == HOTKEY_ID_POPUP:
+                    app.after(0, lambda: bubble_manager.execute_popup_action("translate"))
+    except Exception as error:
+        error_message = str(error)
+        app.after(0, lambda message=error_message: log_debug(f"Hotkeys: помилка реєстрації: {message}"))
+    finally:
+        for hotkey_id in registrations:
+            ctypes.windll.user32.UnregisterHotKey(None, hotkey_id)
+        hotkey_thread_id = None
+
+def rebind_shortcuts():
+    global hotkey_thread
+    stop_global_hotkeys()
+    hotkey_stop_event.clear()
+    hotkey_thread = threading.Thread(target=global_hotkey_loop, daemon=True)
+    hotkey_thread.start()
+
+def stop_global_hotkeys():
+    hotkey_stop_event.set()
+    if hotkey_thread_id:
+        ctypes.windll.user32.PostThreadMessageW(hotkey_thread_id, WM_QUIT, 0, 0)
 
 rebind_shortcuts()
 

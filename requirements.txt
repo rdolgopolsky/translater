@@ -1,7 +1,6 @@
 anthropic
 customtkinter
 google-genai
-keyboard
 pyautogui
 pyperclip
 pynput
