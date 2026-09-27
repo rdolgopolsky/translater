@@ -3,6 +3,9 @@ import os
 import json
 import base64
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta
 import threading
 import ctypes
@@ -42,6 +45,9 @@ API_KEY = ""
 client = None
 ANTHROPIC_API_KEY = ""
 claude_client = None
+DEEPL_API_KEY = ""
+DEEPL_API_URL = "https://api-free.deepl.com/v2/translate"
+DEEPL_MONTHLY_LIMIT = 500_000
 GEMINI_ALLOWED_MODELS = (
     "gemini-flash-lite-latest",
     "gemini-flash-latest",
@@ -73,6 +79,7 @@ USAGE_TOTALS = {
     "Claude": {"input": 0, "output": 0, "cost": 0.0},
 }
 usage_lock = threading.Lock()
+deepl_usage_lock = threading.Lock()
 CLAUDE_INPUT_PRICE_PER_MILLION = 1.0
 CLAUDE_OUTPUT_PRICE_PER_MILLION = 5.0
 gemini_cooldown_until = 0
@@ -90,6 +97,18 @@ def get_gemini_cooldown_seconds(error_text):
         except Exception:
             return 24 * 60 * 60
     return GEMINI_COOLDOWN_SECONDS
+
+def record_deepl_usage(character_count):
+    global deepl_characters_used
+    with deepl_usage_lock:
+        deepl_characters_used += character_count
+        used = deepl_characters_used
+    percent = (used / DEEPL_MONTHLY_LIMIT) * 100
+    log_debug(
+        f"DeepL: використано {used:,} / {DEEPL_MONTHLY_LIMIT:,} символів "
+        f"за місяць ({percent:.2f}%), цей запит: {character_count}"
+    )
+    app.after(0, save_settings)
 
 def record_usage(provider, model, input_tokens, output_tokens):
     rates = MODEL_RATES.get(model)
@@ -183,12 +202,19 @@ def load_settings():
         return {}
 
 saved_settings = load_settings()
+current_usage_month = datetime.now().strftime("%Y-%m")
+saved_usage_month = saved_settings.get("deepl_usage_month")
+deepl_characters_used = (
+    int(saved_settings.get("deepl_characters_used", 0) or 0)
+    if saved_usage_month == current_usage_month else 0
+)
 saved_replace_hotkey = saved_settings.get("replace_hotkey", HOTKEY_REPLACE)
 saved_popup_hotkey = saved_settings.get("popup_hotkey", HOTKEY_POPUP)
 HOTKEY_REPLACE = saved_replace_hotkey if isinstance(saved_replace_hotkey, str) and saved_replace_hotkey.strip() else "ctrl+q"
 HOTKEY_POPUP = saved_popup_hotkey if isinstance(saved_popup_hotkey, str) and saved_popup_hotkey.strip() else "ctrl+w"
 gemini_enabled = saved_settings.get("gemini_enabled", True) is not False
 claude_enabled = saved_settings.get("claude_enabled", True) is not False
+deepl_enabled = saved_settings.get("deepl_enabled", True) is not False
 saved_gemini_model = saved_settings.get("gemini_model", GEMINI_MODEL)
 if not isinstance(saved_gemini_model, str) or saved_gemini_model not in GEMINI_ALLOWED_MODELS:
     saved_gemini_model = GEMINI_MODEL
@@ -199,6 +225,7 @@ if not isinstance(saved_claude_model, str) or saved_claude_model not in CLAUDE_A
 CLAUDE_MODEL = saved_claude_model.strip() or CLAUDE_MODEL
 saved_gemini_api_key = unprotect_secret(saved_settings.get("gemini_api_key", ""))
 saved_claude_api_key = unprotect_secret(saved_settings.get("claude_api_key", ""))
+saved_deepl_api_key = unprotect_secret(saved_settings.get("deepl_api_key", ""))
 
 UI_LANGUAGES = {
     "uk": "Українська",
@@ -212,6 +239,7 @@ UI_TEXT = {
         "context": "Контекст розмови (необов'язково):", "status": "Виділіть текст і скористайтеся гарячою клавішею",
         "debug": "Відкрити дебаг", "api_settings": "Налаштування API", "gemini_key": "Ключ Gemini API:",
         "gemini_model": "Модель Gemini:", "claude_key": "Ключ Claude API:", "claude_model": "Модель Claude:",
+        "deepl_key": "Ключ DeepL API:", "deepl_enabled": "Використовувати DeepL",
         "refresh_models": "Оновити моделі", "models_loading": "Завантаження моделей...",
         "model_price_unknown": "Ціна не визначена API",
         "save": "Зберегти", "debug_title": "Дебаг перекладача",
@@ -233,6 +261,7 @@ UI_TEXT = {
         "context": "Контекст разговора (необязательно):", "status": "Выделите текст и используйте горячую клавишу",
         "debug": "Открыть отладку", "api_settings": "Настройки API", "gemini_key": "Ключ Gemini API:",
         "gemini_model": "Модель Gemini:", "claude_key": "Ключ Claude API:", "claude_model": "Модель Claude:",
+        "deepl_key": "Ключ DeepL API:", "deepl_enabled": "Использовать DeepL",
         "refresh_models": "Обновить модели", "models_loading": "Загрузка моделей...",
         "model_price_unknown": "Цена не указана API",
         "save": "Сохранить", "debug_title": "Отладка переводчика",
@@ -254,6 +283,7 @@ UI_TEXT = {
         "context": "Conversation context (optional):", "status": "Select text and use a hotkey",
         "debug": "Open debug", "api_settings": "API settings", "gemini_key": "Gemini API key:",
         "gemini_model": "Gemini model:", "claude_key": "Claude API key:", "claude_model": "Claude model:",
+        "deepl_key": "DeepL API key:", "deepl_enabled": "Use DeepL",
         "refresh_models": "Refresh models", "models_loading": "Loading models...",
         "model_price_unknown": "Price is not provided by API",
         "save": "Save", "debug_title": "Translator debug",
@@ -285,16 +315,18 @@ def tr(key):
 
 app.title(tr("app_title"))
 
-def configure_api_clients(gemini_key, claude_key):
-    global API_KEY, client, ANTHROPIC_API_KEY, claude_client
+def configure_api_clients(gemini_key, claude_key, deepl_key=None):
+    global API_KEY, client, ANTHROPIC_API_KEY, claude_client, DEEPL_API_KEY
     API_KEY = gemini_key.strip()
     ANTHROPIC_API_KEY = claude_key.strip()
     client = genai.Client(api_key=API_KEY) if API_KEY and gemini_enabled else None
     claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY and claude_enabled else None
+    DEEPL_API_KEY = (deepl_key if deepl_key is not None else saved_deepl_api_key).strip()
 
 configure_api_clients(
     saved_gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
-    saved_claude_api_key or os.getenv("ANTHROPIC_API_KEY", "")
+    saved_claude_api_key or os.getenv("ANTHROPIC_API_KEY", ""),
+    saved_deepl_api_key or os.getenv("DEEPL_API_KEY", "")
 )
 
 # --- 3. UI НАЛАШТУВАННЯ ---
@@ -385,10 +417,14 @@ def save_settings():
         "context": conversation_context_box.get("1.0", "end-1c"),
         "gemini_api_key": protect_secret(API_KEY),
         "claude_api_key": protect_secret(ANTHROPIC_API_KEY),
+        "deepl_api_key": protect_secret(DEEPL_API_KEY),
+        "deepl_usage_month": current_usage_month,
+        "deepl_characters_used": deepl_characters_used,
         "gemini_model": GEMINI_MODEL,
         "claude_model": CLAUDE_MODEL,
         "gemini_enabled": gemini_enabled,
         "claude_enabled": claude_enabled,
+        "deepl_enabled": deepl_enabled,
         "replace_hotkey": HOTKEY_REPLACE,
         "popup_hotkey": HOTKEY_POPUP,
     }
@@ -475,7 +511,7 @@ def show_api_settings():
     global MODEL_DESCRIPTIONS
     api_window = ctk.CTkToplevel(app)
     api_window.title(tr("api_settings"))
-    api_window.geometry("430x500")
+    api_window.geometry("430x610")
     api_window.attributes("-topmost", True)
 
     gemini_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("gemini_enabled"))
@@ -515,6 +551,17 @@ def show_api_settings():
         claude_enabled_checkbox.select()
         claude_fields.pack(fill="x", padx=15)
 
+    deepl_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("deepl_enabled"))
+    deepl_enabled_checkbox.pack(anchor="w", padx=15, pady=(6, 6))
+    deepl_fields = ctk.CTkFrame(api_window, fg_color="transparent")
+    ctk.CTkLabel(deepl_fields, text=tr("deepl_key"), anchor="w").pack(fill="x", pady=(0, 2))
+    deepl_entry = ctk.CTkEntry(deepl_fields, height=30, show="*")
+    deepl_entry.insert(0, DEEPL_API_KEY)
+    deepl_entry.pack(fill="x", pady=(0, 8))
+    if deepl_enabled:
+        deepl_enabled_checkbox.select()
+        deepl_fields.pack(fill="x", padx=15)
+
     def toggle_provider(checkbox, fields, before_widget=None):
         if checkbox.get():
             pack_options = {"fill": "x", "padx": 15}
@@ -526,6 +573,7 @@ def show_api_settings():
 
     gemini_enabled_checkbox.configure(command=lambda: toggle_provider(gemini_enabled_checkbox, gemini_fields, claude_enabled_checkbox))
     claude_enabled_checkbox.configure(command=lambda: toggle_provider(claude_enabled_checkbox, claude_fields, refresh_button))
+    deepl_enabled_checkbox.configure(command=lambda: toggle_provider(deepl_enabled_checkbox, deepl_fields, refresh_button))
 
     def update_model_info(provider, selector, info_label, _selected_model=None):
         info_label.configure(text=model_info_text(provider, selector.get()))
@@ -566,12 +614,13 @@ def show_api_settings():
     refresh_button.pack(pady=(0, 8))
 
     def save_api_settings():
-        global gemini_enabled, claude_enabled, GEMINI_MODEL, CLAUDE_MODEL
+        global gemini_enabled, claude_enabled, deepl_enabled, GEMINI_MODEL, CLAUDE_MODEL
         gemini_enabled = bool(gemini_enabled_checkbox.get())
         claude_enabled = bool(claude_enabled_checkbox.get())
+        deepl_enabled = bool(deepl_enabled_checkbox.get())
         GEMINI_MODEL = gemini_model_select.get().strip() or GEMINI_MODEL
         CLAUDE_MODEL = claude_model_select.get().strip() or CLAUDE_MODEL
-        configure_api_clients(gemini_entry.get(), claude_entry.get())
+        configure_api_clients(gemini_entry.get(), claude_entry.get(), deepl_entry.get())
         save_settings()
         destroy_toplevel(api_window)
 
@@ -735,6 +784,64 @@ def run_claude_action(prompt: str) -> str:
         return f"Помилка Claude: {error_text}"
 
 
+def run_deepl_action(text: str, target_lang: str) -> str:
+    language_codes = {
+        "Ukrainian": "UK",
+        "Russian": "RU",
+        "English": "EN",
+        "Polish": "PL",
+        "German": "DE",
+        "Spanish": "ES",
+        "French": "FR",
+        "Italian": "IT",
+        "Dutch": "NL",
+    }
+    base_language = get_selected_base_language()
+    base_code = language_codes[base_language]
+    target_code = language_codes[target_lang]
+
+    def request_translation(destination):
+        payload = urllib.parse.urlencode({
+            "text": text,
+            "target_lang": destination,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            DEEPL_API_URL,
+            data=payload,
+            headers={
+                "Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        record_deepl_usage(len(text))
+        translation = data["translations"][0]
+        return translation["detected_source_language"], translation["text"]
+
+    detected_language, result = request_translation(base_code)
+    if detected_language == base_code and target_code != base_code:
+        _, result = request_translation(target_code)
+        destination = target_code
+    else:
+        destination = base_code
+    log_debug(f"DeepL: мову визначено як {detected_language}, переклад на {destination}")
+    return result
+
+
+def run_fallback_action(prompt: str, text: str, action_type: str, target_lang: str):
+    claude_error = None
+    if claude_client:
+        log_debug("API: пробую резервний Claude Haiku")
+        claude_result = run_claude_action(prompt)
+        if not claude_result.startswith("Помилка Claude:"):
+            return claude_result
+        claude_error = claude_result
+
+    return claude_error
+
+
 def run_gemini_action(text: str, action_type="translate", target_lang="English", context="") -> str:
     global gemini_cooldown_until
 
@@ -773,6 +880,13 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
     else:
         prompt = f"{context_instruction}Translate to {target_lang}:\n{text}"
 
+    if action_type == "translate" and deepl_enabled and DEEPL_API_KEY:
+        try:
+            log_debug("API: першим пробую DeepL")
+            return run_deepl_action(text, target_lang)
+        except Exception as error:
+            log_debug(f"DeepL: помилка, переходжу до Gemini: {str(error)[:200]}")
+
     if client is None:
         if not gemini_enabled:
             log_debug("API: Gemini вимкнений у налаштуваннях, до запиту обрано Claude")
@@ -780,6 +894,9 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
             log_debug("API: GEMINI_API_KEY is not set, до запиту обрано Claude")
         if claude_client:
             return run_claude_action(prompt)
+        fallback_result = run_fallback_action(prompt, text, action_type, target_lang)
+        if fallback_result is not None:
+            return fallback_result
         return tr("fix_api_missing" if action_type == "fix" else "api_missing")
 
     if time.time() < gemini_cooldown_until:
@@ -788,6 +905,9 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
         if claude_client:
             log_debug("API: Gemini на cooldown, перемикаюся на Claude Haiku")
             return run_claude_action(prompt)
+        fallback_result = run_fallback_action(prompt, text, action_type, target_lang)
+        if fallback_result is not None:
+            return fallback_result
         return tr("gemini_cooldown")
 
     try:
@@ -825,6 +945,9 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
             if claude_client:
                 log_debug("API: Gemini недоступний, перемикаюся на Claude Haiku")
                 return run_claude_action(prompt)
+            fallback_result = run_fallback_action(prompt, text, action_type, target_lang)
+            if fallback_result is not None:
+                return fallback_result
             return (
                 "Вичерпано ліміт запитів Gemini. "
                 "Додайте ключ Claude для автоматичного переходу."
@@ -833,6 +956,9 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
         if claude_client:
             log_debug("API: помилка Gemini, перемикаюся на Claude Haiku")
             return run_claude_action(prompt)
+        fallback_result = run_fallback_action(prompt, text, action_type, target_lang)
+        if fallback_result is not None:
+            return fallback_result
         return f"Помилка Gemini: {error_text}"
 
 def grab_selected_text_direct() -> str:
