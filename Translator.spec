@@ -1,11 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import customtkinter
 
+project_dir = Path(SPECPATH)
+icon_path = str(Path(customtkinter.__file__).parent / 'assets' / 'icons' / 'CustomTkinter_icon_Windows.ico')
 
 a = Analysis(
-    ['translator.py'],
+    [str(project_dir / 'translator.py')],
     pathex=[],
     binaries=[],
-    datas=[('C:/Users/rdolg/AppData/Roaming/Python/Python314/site-packages/customtkinter/assets/icons/CustomTkinter_icon_Windows.ico', 'customtkinter/assets/icons')],
+    datas=[(icon_path, 'customtkinter/assets/icons')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:/Users/rdolg/AppData/Roaming/Python/Python314/site-packages/customtkinter/assets/icons/CustomTkinter_icon_Windows.ico'],
+    icon=[icon_path],
 )

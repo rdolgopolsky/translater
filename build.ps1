@@ -1,27 +1,19 @@
-$ErrorActionPreference = "Stop"
+param([string]$Python)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'python-runtime.ps1')
+$pythonExecutable = Resolve-TranslatorPython -Python $Python
 
-$python = "C:\Python314\python.exe"
-$icon = "C:\Users\rdolg\AppData\Roaming\Python\Python314\site-packages\customtkinter\assets\icons\CustomTkinter_icon_Windows.ico"
-
-if (-not (Test-Path $python)) {
-    throw "Python 3.14 was not found at $python"
+Push-Location $PSScriptRoot
+try {
+    & $pythonExecutable -c 'import customtkinter, PyInstaller'
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Install dependencies first: python -m pip install -r requirements.txt (use the Python from your .venv if present).'
+    }
+    & $pythonExecutable -m PyInstaller --noconfirm --clean (Join-Path $PSScriptRoot 'Translator.spec')
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed with exit code $LASTEXITCODE"
+    }
+    Write-Host ('Built: ' + (Join-Path $PSScriptRoot 'dist\Translator.exe'))
+} finally {
+    Pop-Location
 }
-if (-not (Test-Path $icon)) {
-    throw "Application icon was not found at $icon"
-}
-
-& $python -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --windowed `
-    --name "Translator" `
-    --icon $icon `
-    --add-data "$icon;customtkinter/assets/icons" `
-    translator.py
-
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller failed with exit code $LASTEXITCODE"
-}
-
-Write-Host "Built: dist\Translator.exe"
