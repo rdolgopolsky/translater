@@ -7,7 +7,7 @@ Push-Location $PSScriptRoot
 try {
     & $pythonExecutable -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, PIL, pystray'
     if ($LASTEXITCODE -ne 0) {
-        throw 'Install dependencies first: python -m pip install -r requirements.txt (use the Python from your .venv if present).'
+        throw 'Run setup.ps1 to install the project dependencies.'
     }
     $pythonw = Join-Path (Split-Path -Parent $pythonExecutable) 'pythonw.exe'
     if (-not (Test-Path -LiteralPath $pythonw)) {

@@ -5,9 +5,11 @@ $pythonExecutable = Resolve-TranslatorPython -Python $Python
 
 Push-Location $PSScriptRoot
 try {
-    & $pythonExecutable -c 'import customtkinter, PyInstaller'
+    & $pythonExecutable -m pip check
+    if ($LASTEXITCODE -ne 0) { throw 'Dependency check failed. Run setup.ps1.' }
+    & $pythonExecutable -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, win32api, win32con, win32gui, win32process, PIL, pystray, PyInstaller, tzdata'
     if ($LASTEXITCODE -ne 0) {
-        throw 'Install dependencies first: python -m pip install -r requirements.txt (use the Python from your .venv if present).'
+        throw 'Run setup.ps1 to install the project dependencies.'
     }
     & $pythonExecutable -m PyInstaller --noconfirm --clean (Join-Path $PSScriptRoot 'Translator.spec')
     if ($LASTEXITCODE -ne 0) {

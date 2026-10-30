@@ -8,3 +8,4 @@ pywin32
 Pillow
 pystray
 pyinstaller
+tzdata

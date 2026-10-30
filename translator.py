@@ -24,6 +24,7 @@ import win32api
 import win32con
 import win32gui
 import win32process
+from keyboard_shortcuts import create_key_entry, enable_edit_shortcuts, parse_hotkey, send_ctrl_shortcut
 
 # Run with the current user's permissions so Windows can start the app at logon.
 
@@ -208,8 +209,12 @@ def set_startup_enabled(enabled):
                     winreg.DeleteValue(key, STARTUP_VALUE_NAME)
                 except FileNotFoundError:
                     pass
+        if is_startup_enabled() != bool(enabled):
+            raise OSError("Windows did not retain the startup setting")
+        return True
     except OSError as error:
         log_debug(debug_text("startup_error", error=str(error)[:200]))
+        return False
 
 saved_settings = load_settings()
 theme_mode = saved_settings.get("theme_mode", "Dark")
@@ -601,6 +606,7 @@ context_label = ctk.CTkLabel(app, text=tr("context"), font=("Arial", 16))
 context_label.pack(pady=(6, 2))
 
 conversation_context_box = ctk.CTkTextbox(app, width=340, height=46, wrap="word")
+enable_edit_shortcuts(conversation_context_box)
 conversation_context_box.pack(padx=20, pady=(0, 4))
 conversation_context_box.insert("1.0", saved_settings.get("context", ""))
 
@@ -725,37 +731,59 @@ def show_api_settings():
     api_window.title(tr("api_settings"))
     api_window.geometry("430x620")
     bring_window_to_front(api_window)
+    settings_content = ctk.CTkScrollableFrame(api_window, fg_color="transparent")
+    settings_content.pack(fill="both", expand=True, padx=5, pady=5)
 
-    ctk.CTkLabel(api_window, text=tr("theme"), anchor="w").pack(fill="x", padx=15, pady=(12, 2))
+    ctk.CTkLabel(settings_content, text=tr("theme"), anchor="w").pack(fill="x", padx=15, pady=(12, 2))
     theme_display_values = [tr("theme_system"), tr("theme_dark"), tr("theme_light")]
     theme_display_by_mode = {
         "System": tr("theme_system"),
         "Dark": tr("theme_dark"),
         "Light": tr("theme_light"),
     }
-    theme_mode_select = ctk.CTkOptionMenu(api_window, values=theme_display_values, height=30)
+    theme_mode_select = ctk.CTkOptionMenu(settings_content, values=theme_display_values, height=30)
     theme_mode_select.set(theme_display_by_mode[theme_mode])
     theme_mode_select.pack(fill="x", padx=15, pady=(0, 10))
 
-    ctk.CTkLabel(api_window, text=tr("translation_font_size"), anchor="w").pack(fill="x", padx=15, pady=(0, 2))
+    ctk.CTkLabel(settings_content, text=tr("translation_font_size"), anchor="w").pack(fill="x", padx=15, pady=(0, 2))
     font_size_values = [str(size) for size in (10, 12, 14, 16, 18, 20)]
-    font_size_select = ctk.CTkOptionMenu(api_window, values=font_size_values, height=30)
+    font_size_select = ctk.CTkOptionMenu(settings_content, values=font_size_values, height=30)
     font_size_select.set(str(translation_font_size))
     font_size_select.pack(fill="x", padx=15, pady=(0, 10))
 
-    startup_checkbox = ctk.CTkCheckBox(api_window, text=tr("start_with_windows"))
+    startup_checkbox = ctk.CTkCheckBox(settings_content, text=tr("start_with_windows"))
     startup_checkbox.pack(anchor="w", padx=15, pady=(0, 10))
     if is_startup_enabled():
         startup_checkbox.select()
 
-    gemini_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("gemini_enabled"))
+    def apply_startup_choice():
+        if set_startup_enabled(bool(startup_checkbox.get())):
+            return True
+        if is_startup_enabled():
+            startup_checkbox.select()
+        else:
+            startup_checkbox.deselect()
+        from tkinter import messagebox
+        messagebox.showerror(
+            tr("start_with_windows"),
+            {"uk": "Не вдалося зберегти автозапуск у Windows. Подробиці — у вікні дебагу.",
+             "ru": "Не удалось сохранить автозапуск в Windows. Подробности — в окне отладки.",
+             "en": "Could not save Windows startup. See the debug window for details."}[interface_language],
+            parent=api_window,
+        )
+        return False
+
+    # Startup is a Windows preference: persist the toggle immediately, including
+    # when the user closes settings without pressing Save for the API fields.
+    startup_checkbox.configure(command=apply_startup_choice)
+
+    gemini_enabled_checkbox = ctk.CTkCheckBox(settings_content, text=tr("gemini_enabled"))
     gemini_enabled_checkbox.pack(anchor="w", padx=15, pady=(12, 6))
 
-    gemini_fields = ctk.CTkFrame(api_window, fg_color="transparent")
+    gemini_fields = ctk.CTkFrame(settings_content, fg_color="transparent")
     ctk.CTkLabel(gemini_fields, text=tr("gemini_key"), anchor="w").pack(fill="x", pady=(0, 2))
-    gemini_entry = ctk.CTkEntry(gemini_fields, height=30, show="*")
-    gemini_entry.insert(0, API_KEY)
-    gemini_entry.pack(fill="x", pady=(0, 8))
+    paste_label = {"uk": "Вставити", "ru": "Вставить", "en": "Paste"}.get(interface_language, "Вставити")
+    gemini_entry = create_key_entry(gemini_fields, API_KEY, paste_label)
     ctk.CTkLabel(gemini_fields, text=tr("gemini_model"), anchor="w").pack(fill="x", pady=(0, 2))
     gemini_model_select = ctk.CTkOptionMenu(gemini_fields, values=[GEMINI_MODEL], height=30)
     gemini_model_select.set(GEMINI_MODEL)
@@ -763,13 +791,11 @@ def show_api_settings():
     gemini_model_info = ctk.CTkLabel(gemini_fields, text=model_info_text("gemini", GEMINI_MODEL), anchor="w", justify="left", wraplength=390)
     gemini_model_info.pack(fill="x", pady=(0, 8))
 
-    claude_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("claude_enabled"))
+    claude_enabled_checkbox = ctk.CTkCheckBox(settings_content, text=tr("claude_enabled"))
 
-    claude_fields = ctk.CTkFrame(api_window, fg_color="transparent")
+    claude_fields = ctk.CTkFrame(settings_content, fg_color="transparent")
     ctk.CTkLabel(claude_fields, text=tr("claude_key"), anchor="w").pack(fill="x", pady=(0, 2))
-    claude_entry = ctk.CTkEntry(claude_fields, height=30, show="*")
-    claude_entry.insert(0, ANTHROPIC_API_KEY)
-    claude_entry.pack(fill="x", pady=(0, 8))
+    claude_entry = create_key_entry(claude_fields, ANTHROPIC_API_KEY, paste_label)
     ctk.CTkLabel(claude_fields, text=tr("claude_model"), anchor="w").pack(fill="x", pady=(0, 2))
     claude_model_select = ctk.CTkOptionMenu(claude_fields, values=[CLAUDE_MODEL], height=30)
     claude_model_select.set(CLAUDE_MODEL)
@@ -785,13 +811,11 @@ def show_api_settings():
         claude_enabled_checkbox.select()
         claude_fields.pack(fill="x", padx=15)
 
-    deepl_enabled_checkbox = ctk.CTkCheckBox(api_window, text=tr("deepl_enabled"))
+    deepl_enabled_checkbox = ctk.CTkCheckBox(settings_content, text=tr("deepl_enabled"))
     deepl_enabled_checkbox.pack(anchor="w", padx=15, pady=(6, 6))
-    deepl_fields = ctk.CTkFrame(api_window, fg_color="transparent")
+    deepl_fields = ctk.CTkFrame(settings_content, fg_color="transparent")
     ctk.CTkLabel(deepl_fields, text=tr("deepl_key"), anchor="w").pack(fill="x", pady=(0, 2))
-    deepl_entry = ctk.CTkEntry(deepl_fields, height=30, show="*")
-    deepl_entry.insert(0, DEEPL_API_KEY)
-    deepl_entry.pack(fill="x", pady=(0, 8))
+    deepl_entry = create_key_entry(deepl_fields, DEEPL_API_KEY, paste_label)
     if deepl_enabled:
         deepl_enabled_checkbox.select()
         deepl_fields.pack(fill="x", padx=15)
@@ -852,14 +876,15 @@ def show_api_settings():
         )
         ctk.set_appearance_mode(theme_mode)
         translation_font_size = int(font_size_select.get())
-        set_startup_enabled(bool(startup_checkbox.get()))
+        if not apply_startup_choice():
+            return
         GEMINI_MODEL = gemini_model_select.get().strip() or GEMINI_MODEL
         CLAUDE_MODEL = claude_model_select.get().strip() or CLAUDE_MODEL
         configure_api_clients(gemini_entry.get(), claude_entry.get(), deepl_entry.get())
         save_settings()
         destroy_toplevel(api_window)
 
-    ctk.CTkButton(api_window, text=tr("save"), width=110, height=26, command=save_api_settings).pack()
+    ctk.CTkButton(api_window, text=tr("save"), width=110, height=26, command=save_api_settings).pack(side="bottom", pady=10)
     api_window.protocol("WM_DELETE_WINDOW", lambda: destroy_toplevel(api_window))
     refresh_models()
     api_window.after(50, lambda: bring_window_to_front(api_window))
@@ -1026,6 +1051,7 @@ def show_debug_window():
     bring_window_to_front(debug_window)
 
     debug_box = ctk.CTkTextbox(debug_window, width=530, height=250, wrap="word")
+    enable_edit_shortcuts(debug_box)
     debug_box.pack(padx=10, pady=(10, 5), fill="both", expand=True)
     debug_box.configure(state="disabled")
 
@@ -1337,7 +1363,7 @@ def grab_selected_text_direct() -> str:
 
     clipboard_marker = f"__translator_copy_{time.time_ns()}__"
     pyperclip.copy(clipboard_marker)
-    pyautogui.hotkey('ctrl', 'c')
+    send_ctrl_shortcut('c')
 
     for _ in range(12):
         time.sleep(0.05)
@@ -1526,6 +1552,7 @@ class AssistantBubble:
         self.res_box = ctk.CTkTextbox(
             self.result_popup, width=320, height=text_height, font=("Arial", translation_font_size), wrap="word"
         )
+        enable_edit_shortcuts(self.res_box)
         self.res_box.insert("1.0", text)
         self.res_box.pack(pady=(8, 4), padx=10)
 
@@ -1664,7 +1691,7 @@ class AssistantBubble:
                     except:
                         pass
                 time.sleep(0.08)
-                pyautogui.hotkey('ctrl', 'v')
+                send_ctrl_shortcut('v')
                 log_debug(debug_text("replace_done"))
             finally:
                 self.hide_loading_indicator()
@@ -1688,32 +1715,6 @@ hotkey_thread = None
 hotkey_thread_id = None
 hotkey_stop_event = threading.Event()
 
-def parse_hotkey(hotkey):
-    modifiers = 0
-    key_name = ""
-    modifier_flags = {
-        "alt": MOD_ALT,
-        "ctrl": MOD_CONTROL,
-        "control": MOD_CONTROL,
-        "shift": MOD_SHIFT,
-        "win": MOD_WIN,
-        "windows": MOD_WIN,
-    }
-    for part in hotkey.lower().replace(" ", "").split("+"):
-        if part in modifier_flags:
-            modifiers |= modifier_flags[part]
-        else:
-            key_name = part
-    if len(key_name) != 1:
-        raise ValueError(f"Непідтримувана клавіша в хоткеї: {hotkey}")
-    vk_key_scan = ctypes.windll.user32.VkKeyScanW
-    vk_key_scan.argtypes = [ctypes.c_wchar]
-    vk_key_scan.restype = ctypes.c_short
-    virtual_key = vk_key_scan(key_name.upper()) & 0xFF
-    if virtual_key == 0xFF:
-        raise ValueError(f"Невідома клавіша в хоткеї: {hotkey}")
-    return modifiers, virtual_key
-
 def global_hotkey_loop():
     global hotkey_thread_id
     hotkey_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
@@ -1726,7 +1727,11 @@ def global_hotkey_loop():
             (HOTKEY_ID_LANGUAGE_BASE + index, f"ctrl+alt+{index + 1}")
             for index in range(8)
         ):
-            modifiers, virtual_key = parse_hotkey(hotkey)
+            try:
+                modifiers, virtual_key = parse_hotkey(hotkey)
+            except ValueError as error:
+                app.after(0, lambda message=str(error): log_debug(f"Hotkeys: {debug_text('hotkey_error', error=message)}"))
+                continue
             if not ctypes.windll.user32.RegisterHotKey(None, hotkey_id, modifiers, virtual_key):
                 app.after(0, lambda key=hotkey: log_debug(f"Hotkeys: {debug_text('hotkey_error', error=key)}"))
                 continue

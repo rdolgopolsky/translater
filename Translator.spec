@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 import customtkinter
+from PyInstaller.utils.hooks import collect_data_files
 
 project_dir = Path(SPECPATH)
 icon_path = str(Path(customtkinter.__file__).parent / 'assets' / 'icons' / 'CustomTkinter_icon_Windows.ico')
@@ -9,7 +10,7 @@ a = Analysis(
     [str(project_dir / 'translator.py')],
     pathex=[],
     binaries=[],
-    datas=[(icon_path, 'customtkinter/assets/icons')],
+    datas=collect_data_files('customtkinter') + collect_data_files('tzdata'),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
