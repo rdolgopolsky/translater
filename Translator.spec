@@ -35,6 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    uac_admin=True,
     icon=['C:/Users/rdolg/AppData/Roaming/Python/Python314/site-packages/customtkinter/assets/icons/CustomTkinter_icon_Windows.ico'],
 )

@@ -25,26 +25,7 @@ import win32con
 import win32gui
 import win32process
 
-# --- 1. ПРАВА АДМІНІСТРАТОРА ---
-def is_admin():
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-if not is_admin():
-    if getattr(sys, "frozen", False):
-        pythonw_executable = sys.executable
-        script_arguments = None
-    else:
-        pythonw_executable = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        if not os.path.exists(pythonw_executable):
-            pythonw_executable = sys.executable
-        script_arguments = f'"{os.path.abspath(__file__)}"'
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", pythonw_executable, script_arguments, None, 1
-    )
-    sys.exit()
+# Run with the current user's permissions so Windows can start the app at logon.
 
 API_KEY = ""
 client = None

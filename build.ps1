@@ -15,10 +15,13 @@ if (-not (Test-Path $icon)) {
     --clean `
     --onefile `
     --windowed `
-    --uac-admin `
     --name "Translator" `
     --icon $icon `
     --add-data "$icon;customtkinter/assets/icons" `
     translator.py
+
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed with exit code $LASTEXITCODE"
+}
 
 Write-Host "Built: dist\Translator.exe"
