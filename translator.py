@@ -1528,8 +1528,11 @@ class AssistantBubble:
             destroy_toplevel(self.result_popup)
 
         self.result_popup = ctk.CTkToplevel(self.master)
-        self.result_popup.overrideredirect(True)
-        self.result_popup.attributes("-topmost", True)
+        self.result_popup.title(tr("app_title"))
+        self.result_popup.resizable(False, False)
+        self.result_popup.attributes("-topmost", False)
+        self.result_popup.protocol("WM_DELETE_WINDOW", self.close_result_popup)
+        self.result_popup.bind("<Escape>", self.close_result_popup)
 
         x, y = pyautogui.position()
         popup_height, text_height = self._result_popup_dimensions(text)
@@ -1548,6 +1551,7 @@ class AssistantBubble:
         self.provider_label.configure(cursor="fleur")
         self.provider_label.bind("<ButtonPress-1>", self._start_popup_drag)
         self.provider_label.bind("<B1-Motion>", self._drag_popup)
+        self.provider_label.bind("<ButtonRelease-1>", self._stop_popup_drag)
 
         self.res_box = ctk.CTkTextbox(
             self.result_popup, width=320, height=text_height, font=("Arial", translation_font_size), wrap="word"
@@ -1566,7 +1570,7 @@ class AssistantBubble:
 
         ctk.CTkButton(
             buttons_frame, text=tr("close"), width=70, height=22,
-            fg_color="#D32F2F", hover_color="#B71C1C", command=lambda: destroy_toplevel(self.result_popup)
+            fg_color="#D32F2F", hover_color="#B71C1C", command=self.close_result_popup
         ).pack(side="left", padx=4)
 
         self.master.after(300, lambda: self._bind_autoclose(self.result_popup))
@@ -1589,6 +1593,16 @@ class AssistantBubble:
             self.result_popup.winfo_x(), self.result_popup.winfo_y(),
         )
 
+    def _stop_popup_drag(self, event=None):
+        self.popup_drag_origin = None
+
+    def close_result_popup(self, event=None):
+        if self.result_popup and self.result_popup.winfo_exists():
+            destroy_toplevel(self.result_popup)
+        self.result_popup = None
+        self.popup_drag_origin = None
+        return "break"
+
     def _drag_popup(self, event):
         if not self.popup_drag_origin or not self.result_popup or not self.result_popup.winfo_exists():
             return
@@ -1598,8 +1612,12 @@ class AssistantBubble:
         new_x, new_y = self._clamp_popup_position(
             new_x, new_y, self.result_popup.winfo_width(), self.result_popup.winfo_height()
         )
-        self.result_popup.geometry(
-            f"{self.result_popup.winfo_width()}x{self.result_popup.winfo_height()}+{new_x}+{new_y}"
+        # winfo_width/height are physical pixels, while CTk.geometry scales
+        # dimensions again. Move the native window without supplying any size.
+        hwnd = win32gui.GetParent(self.result_popup.winfo_id())
+        win32gui.SetWindowPos(
+            hwnd, 0, new_x, new_y, 0, 0,
+            win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE,
         )
 
     def _result_popup_dimensions(self, text):
