@@ -3,7 +3,6 @@ customtkinter
 google-genai
 pyautogui
 pyperclip
-pynput
 pywin32
 Pillow
 pystray

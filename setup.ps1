@@ -34,6 +34,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not update pip.' }
 if ($LASTEXITCODE -ne 0) { throw 'Could not install dependencies.' }
 & $venvPython -m pip check
 if ($LASTEXITCODE -ne 0) { throw 'Dependency check failed.' }
-& $venvPython -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, win32api, win32con, win32gui, win32process, PIL, pystray, PyInstaller, lingua; from zoneinfo import ZoneInfo; ZoneInfo(''America/Los_Angeles'')'
+& $venvPython -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, win32crypt, win32api, win32con, win32gui, PIL, pystray, PyInstaller, lingua; from zoneinfo import ZoneInfo; ZoneInfo(''America/Los_Angeles'')'
 if ($LASTEXITCODE -ne 0) { throw 'Environment check failed.' }
 Write-Host 'Ready. Launch: .\Translator.cmd   Build: powershell -ExecutionPolicy Bypass -File .\build.ps1'

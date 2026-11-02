@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import time
+import collections
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -14,7 +15,6 @@ from ctypes import wintypes
 import pyperclip
 import pyautogui
 import customtkinter as ctk
-from pynput import mouse
 from google import genai
 from anthropic import Anthropic
 from PIL import Image, ImageDraw
@@ -23,9 +23,24 @@ import win32crypt
 import win32api
 import win32con
 import win32gui
-import win32process
-from keyboard_shortcuts import create_key_entry, enable_edit_shortcuts, parse_hotkey, send_ctrl_shortcut
+from keyboard_shortcuts import (
+    create_hotkey_recorder,
+    create_key_entry,
+    enable_edit_shortcuts,
+    format_hotkey_display,
+    parse_hotkey,
+    send_ctrl_shortcut,
+)
 from ollama_translation import OllamaTranslator, MODEL as OLLAMA_MODEL
+from translator_i18n import (
+    BASE_LANGUAGE_NAMES,
+    DEBUG_TEXT,
+    MODEL_PRICES,
+    MODEL_RATES,
+    TARGET_LANGUAGE_NAMES,
+    UI_LANGUAGES,
+    UI_TEXT,
+)
 
 # Run with the current user's permissions so Windows can start the app at logon.
 
@@ -48,30 +63,18 @@ CLAUDE_ALLOWED_MODELS = (
 )
 CLAUDE_MODEL = CLAUDE_ALLOWED_MODELS[0]
 MODEL_DESCRIPTIONS = {}
-MODEL_PRICES = {
-    "gemini-2.5-flash": "$0.30 / $2.50 за 1M токенів",
-    "gemini-2.5-pro": "$1.25 / $10.00 за 1M токенів",
-    "claude-haiku-4-5-20251001": "$1.00 / $5.00 за 1M токенів",
-    "claude-sonnet-4-5-20250929": "$3.00 / $15.00 за 1M токенів",
-    "claude-opus-4-1": "$15.00 / $75.00 за 1M токенів",
-}
-MODEL_RATES = {
-    "gemini-2.5-flash": (0.30, 2.50),
-    "gemini-2.5-pro": (1.25, 10.00),
-    "claude-haiku-4-5-20251001": (1.00, 5.00),
-    "claude-sonnet-4-5-20250929": (3.00, 15.00),
-    "claude-opus-4-1": (15.00, 75.00),
-}
 USAGE_TOTALS = {
     "Gemini": {"input": 0, "output": 0, "cost": 0.0},
     "Claude": {"input": 0, "output": 0, "cost": 0.0},
 }
 usage_lock = threading.Lock()
 deepl_usage_lock = threading.Lock()
-CLAUDE_INPUT_PRICE_PER_MILLION = 1.0
-CLAUDE_OUTPUT_PRICE_PER_MILLION = 5.0
+cache_lock = threading.Lock()
+TRANSLATION_CACHE = collections.OrderedDict()
+MAX_CACHE_ENTRIES = 64
 gemini_cooldown_until = 0
 GEMINI_COOLDOWN_SECONDS = 60
+
 
 def get_gemini_cooldown_seconds(error_text):
     if "PerDay" in error_text or "RequestsPerDay" in error_text:
@@ -86,6 +89,7 @@ def get_gemini_cooldown_seconds(error_text):
             return 24 * 60 * 60
     return GEMINI_COOLDOWN_SECONDS
 
+
 def record_deepl_usage(character_count):
     global deepl_characters_used
     with deepl_usage_lock:
@@ -96,6 +100,7 @@ def record_deepl_usage(character_count):
         f"DeepL: {debug_text('deepl_usage', used=used, limit=DEEPL_MONTHLY_LIMIT, percent=percent, count=character_count)}"
     )
     app.after(0, save_settings)
+
 
 def record_usage(provider, model, input_tokens, output_tokens):
     rates = MODEL_RATES.get(model)
@@ -119,6 +124,7 @@ def record_usage(provider, model, input_tokens, output_tokens):
     else:
         log_debug(f"{provider}: {debug_text('usage_known', input=input_tokens, output=output_tokens, total=total_tokens, cost=request_cost, session_cost=totals['cost'])}")
 
+
 if sys.platform.startswith("win"):
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Translator.App")
@@ -130,7 +136,7 @@ ctk.set_default_color_theme("blue")
 
 app = ctk.CTk()
 app.title("Перекладач")
-app.geometry("380x500")
+app.geometry("380x525")
 app.resizable(False, False)
 app.attributes("-topmost", True)
 try:
@@ -144,11 +150,14 @@ except Exception:
 # --- 2. ГЛОБАЛЬНИЙ СТАН ---
 HOTKEY_REPLACE = "ctrl+q"
 HOTKEY_POPUP = "ctrl+w"
+HOTKEY_FIX = "ctrl+e"
 SETTINGS_FILE = os.path.join(
     os.getenv("APPDATA", os.path.expanduser("~")),
     "translator_settings.json"
 )
 SECRET_PREFIX = "dpapi:"
+_save_debounce_job = None
+
 
 def protect_secret(value):
     if not value:
@@ -160,6 +169,7 @@ def protect_secret(value):
         return SECRET_PREFIX + base64.b64encode(encrypted).decode("ascii")
     except Exception:
         return value
+
 
 def unprotect_secret(value):
     if not isinstance(value, str) or not value:
@@ -173,6 +183,7 @@ def unprotect_secret(value):
     except Exception:
         return ""
 
+
 def load_settings():
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as settings_file:
@@ -181,8 +192,10 @@ def load_settings():
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
+
 STARTUP_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "Translator"
+
 
 def startup_command():
     if getattr(sys, "frozen", False):
@@ -192,6 +205,7 @@ def startup_command():
         pythonw = sys.executable
     return f'"{pythonw}" "{os.path.abspath(__file__)}"'
 
+
 def is_startup_enabled():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STARTUP_REGISTRY_PATH) as key:
@@ -199,6 +213,7 @@ def is_startup_enabled():
             return True
     except (FileNotFoundError, OSError):
         return False
+
 
 def set_startup_enabled(enabled):
     try:
@@ -216,6 +231,7 @@ def set_startup_enabled(enabled):
     except OSError as error:
         log_debug(debug_text("startup_error", error=str(error)[:200]))
         return False
+
 
 saved_settings = load_settings()
 theme_mode = saved_settings.get("theme_mode", "Dark")
@@ -236,8 +252,10 @@ deepl_characters_used = (
 )
 saved_replace_hotkey = saved_settings.get("replace_hotkey", HOTKEY_REPLACE)
 saved_popup_hotkey = saved_settings.get("popup_hotkey", HOTKEY_POPUP)
-HOTKEY_REPLACE = saved_replace_hotkey if isinstance(saved_replace_hotkey, str) and saved_replace_hotkey.strip() else "ctrl+q"
-HOTKEY_POPUP = saved_popup_hotkey if isinstance(saved_popup_hotkey, str) and saved_popup_hotkey.strip() else "ctrl+w"
+saved_fix_hotkey = saved_settings.get("fix_hotkey", HOTKEY_FIX)
+HOTKEY_REPLACE = saved_replace_hotkey.strip().lower() if isinstance(saved_replace_hotkey, str) and saved_replace_hotkey.strip() else "ctrl+q"
+HOTKEY_POPUP = saved_popup_hotkey.strip().lower() if isinstance(saved_popup_hotkey, str) and saved_popup_hotkey.strip() else "ctrl+w"
+HOTKEY_FIX = saved_fix_hotkey.strip().lower() if isinstance(saved_fix_hotkey, str) and saved_fix_hotkey.strip() else "ctrl+e"
 gemini_enabled = saved_settings.get("gemini_enabled", True) is not False
 claude_enabled = saved_settings.get("claude_enabled", True) is not False
 deepl_enabled = saved_settings.get("deepl_enabled", True) is not False
@@ -255,174 +273,23 @@ saved_gemini_api_key = unprotect_secret(saved_settings.get("gemini_api_key", "")
 saved_claude_api_key = unprotect_secret(saved_settings.get("claude_api_key", ""))
 saved_deepl_api_key = unprotect_secret(saved_settings.get("deepl_api_key", ""))
 
-UI_LANGUAGES = {
-    "uk": "Українська",
-    "ru": "Русский",
-    "en": "English",
-}
-UI_TEXT = {
-    "uk": {
-        "app_title": "Перекладач", "interface_language": "Мова інтерфейсу:",
-        "main_language": "Основна мова:", "translate_language": "Мова перекладу:",
-        "context": "Контекст розмови (необов'язково):", "status": "Виділіть текст і скористайтеся гарячою клавішею",
-        "debug": "Відкрити дебаг", "api_settings": "Налаштування API", "gemini_key": "Ключ Gemini API:",
-        "gemini_model": "Модель Gemini:", "claude_key": "Ключ Claude API:", "claude_model": "Модель Claude:",
-        "deepl_key": "Ключ DeepL API:", "deepl_enabled": "Використовувати DeepL",
-        "theme": "Тема:", "theme_system": "Системна", "theme_dark": "Темна", "theme_light": "Світла",
-        "translation_font_size": "Розмір шрифту перекладу:",
-        "start_with_windows": "Запускати разом із Windows", "close_question": "Що зробити із застосунком?\nТак — згорнути в трей\nНі — закрити застосунок",
-        "tray_open": "Відкрити", "tray_close": "Закрити",
-        "language_settings": "Налаштування мов", "language_slot": "Мова {number}:", "add_language": "Додати мову", "all_languages_selected": "Усі 8 вибрано",
-        "other_languages": "Інша мова...",
-        "remember_choice": "Запам'ятати мій вибір", "close_to_tray": "Згорнути в трей", "close_exit": "Закрити застосунок", "cancel": "Скасувати",
-        "refresh_models": "Оновити моделі", "models_loading": "Завантаження моделей...",
-        "model_price_unknown": "Ціна не визначена API",
-        "save": "Зберегти", "debug_title": "Дебаг перекладача",
-        "clear": "Очистити", "close": "Закрити", "choose_action": "Виберіть дію:",
-        "translate": "🌐 Перекласти", "replace": "✍️ Замінити текст", "fix": "📝 Виправити помилки",
-        "copy": "Копіювати", "loading": "⏳ Завантаження...", "processing": "⏳ Обробка...",
-        "no_text": "Текст не знайдено", "api_missing": "Немає доступного сервісу перекладу.",
-        "busy": "Попередній запит ще виконується.",
-        "fix_api_missing": "Для виправлення тексту задайте ключ Gemini або Claude API.",
-        "gemini_cooldown": "Gemini тимчасово недоступний через ліміт запитів.",
-        "replace_hotkey": "Заміна тексту:", "popup_hotkey": "Показ перекладу:",
-        "hotkey_hint": "Приклад: ctrl+q або ctrl+shift+t",
-        "gemini_enabled": "Використовувати Gemini", "claude_enabled": "Використовувати Claude",
-        "replace_hotkey_info": "Замінити виділений текст:", "popup_hotkey_info": "Показати переклад:",
-    },
-    "ru": {
-        "app_title": "Переводчик", "interface_language": "Язык интерфейса:",
-        "main_language": "Основной язык:", "translate_language": "Язык перевода:",
-        "context": "Контекст разговора (необязательно):", "status": "Выделите текст и используйте горячую клавишу",
-        "debug": "Открыть отладку", "api_settings": "Настройки API", "gemini_key": "Ключ Gemini API:",
-        "gemini_model": "Модель Gemini:", "claude_key": "Ключ Claude API:", "claude_model": "Модель Claude:",
-        "deepl_key": "Ключ DeepL API:", "deepl_enabled": "Использовать DeepL",
-        "theme": "Тема:", "theme_system": "Системная", "theme_dark": "Тёмная", "theme_light": "Светлая",
-        "translation_font_size": "Размер шрифта перевода:",
-        "start_with_windows": "Запускать вместе с Windows", "close_question": "Что сделать с приложением?\nДа — свернуть в трей\nНет — закрыть приложение",
-        "tray_open": "Открыть", "tray_close": "Закрыть",
-        "language_settings": "Настройки языков", "language_slot": "Язык {number}:", "add_language": "Добавить язык", "all_languages_selected": "Все 8 выбраны",
-        "other_languages": "Другой язык...",
-        "remember_choice": "Запомнить мой выбор", "close_to_tray": "Свернуть в трей", "close_exit": "Закрыть приложение", "cancel": "Отмена",
-        "refresh_models": "Обновить модели", "models_loading": "Загрузка моделей...",
-        "model_price_unknown": "Цена не указана API",
-        "save": "Сохранить", "debug_title": "Отладка переводчика",
-        "clear": "Очистить", "close": "Закрыть", "choose_action": "Выберите действие:",
-        "translate": "🌐 Перевести", "replace": "✍️ Заменить текст", "fix": "📝 Исправить ошибки",
-        "copy": "Копировать", "loading": "⏳ Загрузка...", "processing": "⏳ Обработка...",
-        "no_text": "Текст не найден", "api_missing": "Нет доступного сервиса перевода.",
-        "busy": "Предыдущий запрос ещё выполняется.",
-        "fix_api_missing": "Для исправления текста укажите ключ Gemini или Claude API.",
-        "gemini_cooldown": "Gemini временно недоступен из-за лимита запросов.",
-        "replace_hotkey": "Замена текста:", "popup_hotkey": "Показ перевода:",
-        "hotkey_hint": "Пример: ctrl+q или ctrl+shift+t",
-        "gemini_enabled": "Использовать Gemini", "claude_enabled": "Использовать Claude",
-        "replace_hotkey_info": "Заменить выделенный текст:", "popup_hotkey_info": "Показать перевод:",
-    },
-    "en": {
-        "app_title": "Translator", "interface_language": "Interface language:",
-        "main_language": "Main language:", "translate_language": "Translation language:",
-        "context": "Conversation context (optional):", "status": "Select text and use a hotkey",
-        "debug": "Open debug", "api_settings": "API settings", "gemini_key": "Gemini API key:",
-        "gemini_model": "Gemini model:", "claude_key": "Claude API key:", "claude_model": "Claude model:",
-        "deepl_key": "DeepL API key:", "deepl_enabled": "Use DeepL",
-        "theme": "Theme:", "theme_system": "System", "theme_dark": "Dark", "theme_light": "Light",
-        "translation_font_size": "Translation font size:",
-        "start_with_windows": "Start with Windows", "close_question": "What should happen to the app?\nYes — minimize to tray\nNo — close the app",
-        "tray_open": "Open", "tray_close": "Close",
-        "language_settings": "Language settings", "language_slot": "Language {number}:", "add_language": "Add language", "all_languages_selected": "All 8 selected",
-        "other_languages": "Other language...",
-        "remember_choice": "Remember my choice", "close_to_tray": "Minimize to tray", "close_exit": "Close application", "cancel": "Cancel",
-        "refresh_models": "Refresh models", "models_loading": "Loading models...",
-        "model_price_unknown": "Price is not provided by API",
-        "save": "Save", "debug_title": "Translator debug",
-        "clear": "Clear", "close": "Close", "choose_action": "Choose an action:",
-        "translate": "🌐 Translate", "replace": "✍️ Replace text", "fix": "📝 Fix mistakes",
-        "copy": "Copy", "loading": "⏳ Loading...", "processing": "⏳ Processing...",
-        "no_text": "Text not found", "api_missing": "No translation service is available.",
-        "busy": "The previous request is still running.",
-        "fix_api_missing": "Set a Gemini or Claude API key to correct text.",
-        "gemini_cooldown": "Gemini is temporarily unavailable because of the request limit.",
-        "replace_hotkey": "Replace text:", "popup_hotkey": "Show translation:",
-        "hotkey_hint": "Example: ctrl+q or ctrl+shift+t",
-        "gemini_enabled": "Use Gemini", "claude_enabled": "Use Claude",
-        "replace_hotkey_info": "Replace selected text:", "popup_hotkey_info": "Show translation:",
-    },
-}
-BASE_LANGUAGE_NAMES = {
-    "uk": {"Ukrainian": "Українська", "Russian": "Російська", "English": "Англійська"},
-    "ru": {"Ukrainian": "Украинский", "Russian": "Русский", "English": "Английский"},
-    "en": {"Ukrainian": "Ukrainian", "Russian": "Russian", "English": "English"},
-}
-DEBUG_TEXT = {
-    "uk": {
-        "models_gemini_error": "Моделі Gemini: помилка: {error}", "models_claude_error": "Моделі Claude: помилка: {error}",
-        "request_model": "запит до моделі {model}", "response": "отримано відповідь: {result}", "error": "помилка: {error}",
-        "deepl_language": "мову визначено як {source}, переклад на {target}", "fallback_claude": "пробую резервний Claude Haiku",
-        "action_request": "запит на {action}, текст: {text}", "deepl_first": "першим пробую DeepL", "deepl_to_gemini": "помилка, переходжу до Gemini: {error}",
-        "gemini_disabled": "Gemini вимкнений у налаштуваннях, до запиту обрано Claude", "gemini_missing": "GEMINI_API_KEY is not set, до запиту обрано Claude",
-        "cooldown": "Gemini пропущено, cooldown ще {seconds} с", "cooldown_claude": "Gemini на cooldown, перемикаюся на Claude Haiku",
-        "instruction_fallback": "відповідь схожа на інструкції, пробую Claude", "quota": "перевищено квоту (429 RESOURCE_EXHAUSTED)",
-        "cooldown_hours": "Gemini пропущено на {hours} год.", "unavailable_claude": "Gemini недоступний, перемикаюся на Claude Haiku",
-        "error_claude": "помилка Gemini, перемикаюся на Claude Haiku", "buffer_received": "отримано {length} символів",
-        "buffer_missing": "Ctrl+C не змінив буфер обміну", "popup_started": "Вікно перекладу: команда запущена",
-        "replace_started": "Заміна: команда Ctrl+Q спрацювала", "replace_done": "Заміна: результат вставлено",
-        "hotkey_error": "помилка реєстрації: {error}",
-        "startup_error": "помилка автозапуску: {error}",
-        "usage_unknown": "токени: {input} вхідних + {output} вихідних = {total}; ціна поки невідома для {model}; за сесію {session} токенів",
-        "usage_known": "токени: {input} вхідних + {output} вихідних = {total}; цей запит приблизно ${cost:.6f}; за сесію приблизно ${session_cost:.6f}",
-        "deepl_usage": "використано {used:,} / {limit:,} символів за місяць ({percent:.2f}%), цей запит: {count}",
-    },
-    "ru": {
-        "models_gemini_error": "Модели Gemini: ошибка: {error}", "models_claude_error": "Модели Claude: ошибка: {error}",
-        "request_model": "запрос к модели {model}", "response": "получен ответ: {result}", "error": "ошибка: {error}",
-        "deepl_language": "язык определён как {source}, перевод на {target}", "fallback_claude": "пробую резервный Claude Haiku",
-        "action_request": "запрос на {action}, текст: {text}", "deepl_first": "сначала пробую DeepL", "deepl_to_gemini": "ошибка, перехожу к Gemini: {error}",
-        "gemini_disabled": "Gemini выключен в настройках, до запроса выбран Claude", "gemini_missing": "GEMINI_API_KEY is not set, до запроса выбран Claude",
-        "cooldown": "Gemini пропущен, cooldown ещё {seconds} с", "cooldown_claude": "Gemini на cooldown, переключаюсь на Claude Haiku",
-        "instruction_fallback": "ответ похож на инструкции, пробую Claude", "quota": "превышена квота (429 RESOURCE_EXHAUSTED)",
-        "cooldown_hours": "Gemini пропущен на {hours} ч.", "unavailable_claude": "Gemini недоступен, переключаюсь на Claude Haiku",
-        "error_claude": "ошибка Gemini, переключаюсь на Claude Haiku", "buffer_received": "получено {length} символов",
-        "buffer_missing": "Ctrl+C не изменил буфер обмена", "popup_started": "Окно перевода: команда запущена",
-        "replace_started": "Замена: команда Ctrl+Q сработала", "replace_done": "Замена: результат вставлен",
-        "hotkey_error": "ошибка регистрации: {error}",
-        "startup_error": "ошибка автозапуска: {error}",
-        "usage_unknown": "токены: {input} входных + {output} выходных = {total}; цена пока неизвестна для {model}; за сессию {session} токенов",
-        "usage_known": "токены: {input} входных + {output} выходных = {total}; этот запрос примерно ${cost:.6f}; за сессию примерно ${session_cost:.6f}",
-        "deepl_usage": "использовано {used:,} / {limit:,} символов за месяц ({percent:.2f}%), этот запрос: {count}",
-    },
-    "en": {
-        "models_gemini_error": "Gemini models: error: {error}", "models_claude_error": "Claude models: error: {error}",
-        "request_model": "request to model {model}", "response": "received response: {result}", "error": "error: {error}",
-        "deepl_language": "detected language {source}, translating to {target}", "fallback_claude": "trying fallback Claude Haiku",
-        "action_request": "request for {action}, text: {text}", "deepl_first": "trying DeepL first", "deepl_to_gemini": "error, switching to Gemini: {error}",
-        "gemini_disabled": "Gemini disabled in settings, Claude selected before request", "gemini_missing": "GEMINI_API_KEY is not set, Claude selected before request",
-        "cooldown": "Gemini skipped, cooldown remaining {seconds} s", "cooldown_claude": "Gemini on cooldown, switching to Claude Haiku",
-        "instruction_fallback": "response looks like instructions, trying Claude", "quota": "quota exceeded (429 RESOURCE_EXHAUSTED)",
-        "cooldown_hours": "Gemini skipped for {hours} hours.", "unavailable_claude": "Gemini unavailable, switching to Claude Haiku",
-        "error_claude": "Gemini error, switching to Claude Haiku", "buffer_received": "received {length} characters",
-        "buffer_missing": "Ctrl+C did not change the clipboard", "popup_started": "Translation window: command started",
-        "replace_started": "Replace: Ctrl+Q triggered", "replace_done": "Replace: result inserted",
-        "hotkey_error": "registration error: {error}",
-        "startup_error": "startup error: {error}",
-        "usage_unknown": "tokens: {input} input + {output} output = {total}; price is unknown for {model}; {session} session tokens",
-        "usage_known": "tokens: {input} input + {output} output = {total}; this request approx. ${cost:.6f}; session approx. ${session_cost:.6f}",
-        "deepl_usage": "used {used:,} / {limit:,} characters this month ({percent:.2f}%), this request: {count}",
-    },
-}
 
 def debug_text(key, **values):
     return DEBUG_TEXT[interface_language][key].format(**values)
+
 
 saved_base_language = saved_settings.get("base_language", "Ukrainian")
 interface_language = {"Ukrainian": "uk", "Russian": "ru", "English": "en"}.get(
     saved_base_language, "uk"
 )
 
+
 def tr(key):
     return UI_TEXT[interface_language][key]
 
+
 app.title(tr("app_title"))
+
 
 def configure_api_clients(gemini_key, claude_key, deepl_key=None):
     global API_KEY, client, ANTHROPIC_API_KEY, claude_client, DEEPL_API_KEY
@@ -431,6 +298,9 @@ def configure_api_clients(gemini_key, claude_key, deepl_key=None):
     client = genai.Client(api_key=API_KEY) if API_KEY and gemini_enabled else None
     claude_client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY and claude_enabled else None
     DEEPL_API_KEY = (deepl_key if deepl_key is not None else saved_deepl_api_key).strip()
+    with cache_lock:
+        TRANSLATION_CACHE.clear()
+
 
 configure_api_clients(
     saved_gemini_api_key or os.getenv("GEMINI_API_KEY", ""),
@@ -468,11 +338,6 @@ target_languages = {
     "CS": "Czech", "AR": "Arabic", "SV": "Swedish", "DA": "Danish",
     "FI": "Finnish", "UK": "Ukrainian", "RU": "Russian",
 }
-TARGET_LANGUAGE_NAMES = {
-    "uk": {"English": "Англійська", "Polish": "Польська", "German": "Німецька", "Spanish": "Іспанська", "French": "Французька", "Italian": "Італійська", "Dutch": "Нідерландська", "Japanese": "Японська", "Korean": "Корейська", "Chinese": "Китайська", "Portuguese": "Португальська", "Turkish": "Турецька", "Czech": "Чеська", "Arabic": "Арабська", "Swedish": "Шведська", "Danish": "Данська", "Finnish": "Фінська", "Ukrainian": "Українська", "Russian": "Російська"},
-    "ru": {"English": "Английский", "Polish": "Польский", "German": "Немецкий", "Spanish": "Испанский", "French": "Французский", "Italian": "Итальянский", "Dutch": "Нидерландский", "Japanese": "Японский", "Korean": "Корейский", "Chinese": "Китайский", "Portuguese": "Португальский", "Turkish": "Турецкий", "Czech": "Чешский", "Arabic": "Арабский", "Swedish": "Шведский", "Danish": "Датский", "Finnish": "Финский", "Ukrainian": "Украинский", "Russian": "Русский"},
-    "en": {language: language for language in target_languages.values()},
-}
 default_target_languages = ["English", "Polish", "German", "Spanish", "French", "Italian", "Dutch", "Japanese"]
 saved_target_languages = saved_settings.get("target_languages", default_target_languages)
 if not isinstance(saved_target_languages, list):
@@ -481,7 +346,10 @@ selected_target_languages = []
 for language in saved_target_languages:
     if language in target_languages.values() and language not in selected_target_languages:
         selected_target_languages.append(language)
-selected_target_languages = (selected_target_languages + default_target_languages)[:8]
+for fallback_lang in default_target_languages:
+    if fallback_lang not in selected_target_languages:
+        selected_target_languages.append(fallback_lang)
+selected_target_languages = selected_target_languages[:8]
 saved_target_language = saved_settings.get("target_language", selected_target_languages[0])
 target_language = saved_target_language if saved_target_language in selected_target_languages else selected_target_languages[0]
 language_buttons = {}
@@ -499,6 +367,7 @@ language_settings_button.pack(side="left", padx=(6, 0))
 lang_buttons_frame = ctk.CTkFrame(app, fg_color="transparent")
 lang_buttons_frame.pack(pady=(0, 4))
 
+
 def select_target_language(language):
     global target_language
     target_language = language
@@ -509,9 +378,11 @@ def select_target_language(language):
         )
     save_settings()
 
+
 def select_target_language_slot(slot_index):
     if 0 <= slot_index < len(selected_target_languages):
         select_target_language(selected_target_languages[slot_index])
+
 
 def add_target_language(selected_display):
     if selected_display == tr("other_languages"):
@@ -523,6 +394,7 @@ def add_target_language(selected_display):
     )
     if selected_language and selected_language not in selected_target_languages:
         select_target_language(selected_language)
+
 
 def rebuild_target_language_buttons():
     global language_add_select
@@ -561,6 +433,7 @@ def rebuild_target_language_buttons():
     language_add_select.grid(row=2, column=2, padx=3, pady=3)
     if not available_languages:
         language_add_select.configure(state="disabled")
+
 
 def show_language_settings():
     settings_window = ctk.CTkToplevel(app)
@@ -603,6 +476,7 @@ def show_language_settings():
     ctk.CTkButton(settings_window, text=tr("save"), width=120, height=28, command=save_language_order).pack(pady=12)
     settings_window.protocol("WM_DELETE_WINDOW", lambda: (settings_window.grab_release(), destroy_toplevel(settings_window)))
 
+
 rebuild_target_language_buttons()
 
 context_label = ctk.CTkLabel(app, text=tr("context"), font=("Arial", 16))
@@ -613,7 +487,15 @@ enable_edit_shortcuts(conversation_context_box)
 conversation_context_box.pack(padx=20, pady=(0, 4))
 conversation_context_box.insert("1.0", saved_settings.get("context", ""))
 
+
 def save_settings():
+    global _save_debounce_job
+    if _save_debounce_job is not None:
+        try:
+            app.after_cancel(_save_debounce_job)
+        except Exception:
+            pass
+        _save_debounce_job = None
     base_language_display = base_lang_select.get()
     base_language = next(
         (language for language, name in BASE_LANGUAGE_NAMES[interface_language].items()
@@ -642,12 +524,24 @@ def save_settings():
         "ollama_enabled": ollama_enabled,
         "replace_hotkey": HOTKEY_REPLACE,
         "popup_hotkey": HOTKEY_POPUP,
+        "fix_hotkey": HOTKEY_FIX,
     }
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as settings_file:
             json.dump(settings, settings_file, ensure_ascii=False, indent=2)
     except OSError:
         pass
+
+
+def schedule_save_settings(delay_ms=400):
+    global _save_debounce_job
+    if _save_debounce_job is not None:
+        try:
+            app.after_cancel(_save_debounce_job)
+        except Exception:
+            pass
+    _save_debounce_job = app.after(delay_ms, save_settings)
+
 
 def select_base_language(selected_name):
     global interface_language
@@ -660,12 +554,20 @@ def select_base_language(selected_name):
     apply_interface_language(selected_language)
     save_settings()
 
+
 def get_selected_base_language():
     return next(
         (language for language, name in BASE_LANGUAGE_NAMES[interface_language].items()
          if name == base_lang_select.get()),
         "Ukrainian"
     )
+
+
+def update_hotkey_labels():
+    replace_hotkey_value.configure(text=format_hotkey_display(HOTKEY_REPLACE))
+    popup_hotkey_value.configure(text=format_hotkey_display(HOTKEY_POPUP))
+    fix_hotkey_value.configure(text=format_hotkey_display(HOTKEY_FIX))
+
 
 def apply_interface_language(current_base_language=None):
     if current_base_language is None:
@@ -678,16 +580,18 @@ def apply_interface_language(current_base_language=None):
     lang_label.configure(text=tr("translate_language"))
     language_settings_button.configure(text="⚙")
     rebuild_target_language_buttons()
-    for code, button in language_buttons.items():
-        button.configure(text=TARGET_LANGUAGE_NAMES[interface_language][target_languages[code]])
     context_label.configure(text=tr("context"))
     status_lbl.configure(text=tr("status"))
     replace_hotkey_info.configure(text=tr("replace_hotkey_info"))
     popup_hotkey_info.configure(text=tr("popup_hotkey_info"))
+    fix_hotkey_info.configure(text=tr("fix_hotkey_info"))
+    update_hotkey_labels()
     debug_button.configure(text=tr("debug"))
+
 
 def model_price(model_name):
     return MODEL_PRICES.get(model_name, tr("model_price_unknown"))
+
 
 def fetch_model_catalog():
     catalog = {"gemini": {}, "claude": {}}
@@ -719,21 +623,24 @@ def fetch_model_catalog():
             log_debug(debug_text("models_claude_error", error=str(error)[:200]))
     return catalog
 
+
 def model_info_text(provider, model_name):
     description = MODEL_DESCRIPTIONS.get(provider, {}).get(model_name, "")
     price = model_price(model_name)
     return f"{description}\n{price}" if description else price
+
 
 def bring_window_to_front(window):
     window.attributes("-topmost", True)
     window.lift()
     window.focus_force()
 
+
 def show_api_settings():
     global MODEL_DESCRIPTIONS, theme_mode, translation_font_size
     api_window = ctk.CTkToplevel(app)
     api_window.title(tr("api_settings"))
-    api_window.geometry("430x620")
+    api_window.geometry("430x660")
     bring_window_to_front(api_window)
     settings_content = ctk.CTkScrollableFrame(api_window, fg_color="transparent")
     settings_content.pack(fill="both", expand=True, padx=5, pady=5)
@@ -754,6 +661,31 @@ def show_api_settings():
     font_size_select = ctk.CTkOptionMenu(settings_content, values=font_size_values, height=30)
     font_size_select.set(str(translation_font_size))
     font_size_select.pack(fill="x", padx=15, pady=(0, 10))
+
+    # --- Hotkey customization fields (Click & Press keys) ---
+    record_prompt = tr("record_hotkey_prompt")
+    ctk.CTkLabel(settings_content, text=tr("replace_hotkey"), anchor="w").pack(fill="x", padx=15, pady=(2, 2))
+    replace_hotkey_entry = create_hotkey_recorder(
+        settings_content, HOTKEY_REPLACE, prompt_text=record_prompt,
+        on_record_start=stop_global_hotkeys, on_record_end=rebind_shortcuts,
+    )
+    replace_hotkey_entry.pack(fill="x", padx=15, pady=(0, 6))
+
+    ctk.CTkLabel(settings_content, text=tr("popup_hotkey"), anchor="w").pack(fill="x", padx=15, pady=(0, 2))
+    popup_hotkey_entry = create_hotkey_recorder(
+        settings_content, HOTKEY_POPUP, prompt_text=record_prompt,
+        on_record_start=stop_global_hotkeys, on_record_end=rebind_shortcuts,
+    )
+    popup_hotkey_entry.pack(fill="x", padx=15, pady=(0, 6))
+
+    ctk.CTkLabel(settings_content, text=tr("fix_hotkey"), anchor="w").pack(fill="x", padx=15, pady=(0, 2))
+    fix_hotkey_entry = create_hotkey_recorder(
+        settings_content, HOTKEY_FIX, prompt_text=record_prompt,
+        on_record_start=stop_global_hotkeys, on_record_end=rebind_shortcuts,
+    )
+    fix_hotkey_entry.pack(fill="x", padx=15, pady=(0, 2))
+
+    ctk.CTkLabel(settings_content, text=tr("hotkey_hint"), text_color="gray", anchor="w", wraplength=380, justify="left").pack(fill="x", padx=15, pady=(0, 10))
 
     startup_checkbox = ctk.CTkCheckBox(settings_content, text=tr("start_with_windows"))
     startup_checkbox.pack(anchor="w", padx=15, pady=(0, 10))
@@ -777,8 +709,6 @@ def show_api_settings():
         )
         return False
 
-    # Startup is a Windows preference: persist the toggle immediately, including
-    # when the user closes settings without pressing Save for the API fields.
     startup_checkbox.configure(command=apply_startup_choice)
 
     ollama_checkbox = ctk.CTkCheckBox(settings_content, text={
@@ -861,10 +791,10 @@ def show_api_settings():
         MODEL_DESCRIPTIONS = catalog
         gemini_models = [model for model in GEMINI_ALLOWED_MODELS if model in catalog["gemini"]]
         if not gemini_models:
-            gemini_models = [GEMINI_MODEL]
+            gemini_models = list(GEMINI_ALLOWED_MODELS)
         claude_models = [model for model in CLAUDE_ALLOWED_MODELS if model in catalog["claude"]]
         if not claude_models:
-            claude_models = [CLAUDE_MODEL]
+            claude_models = list(CLAUDE_ALLOWED_MODELS)
         selected_gemini_model = GEMINI_MODEL if GEMINI_MODEL in gemini_models else (
             "gemini-flash-latest" if "gemini-flash-latest" in gemini_models else gemini_models[0]
         )
@@ -875,6 +805,7 @@ def show_api_settings():
         claude_model_select.set(selected_claude_model)
         gemini_model_info.configure(text=model_info_text("gemini", selected_gemini_model))
         claude_model_info.configure(text=model_info_text("claude", selected_claude_model))
+
     def refresh_models():
         def worker():
             catalog = fetch_model_catalog()
@@ -884,7 +815,24 @@ def show_api_settings():
 
     def save_api_settings():
         global gemini_enabled, claude_enabled, deepl_enabled, GEMINI_MODEL, CLAUDE_MODEL, theme_mode, translation_font_size
-        global ollama_enabled
+        global ollama_enabled, HOTKEY_REPLACE, HOTKEY_POPUP, HOTKEY_FIX
+
+        new_replace = replace_hotkey_entry.get().strip().lower() or "ctrl+q"
+        new_popup = popup_hotkey_entry.get().strip().lower() or "ctrl+w"
+        new_fix = fix_hotkey_entry.get().strip().lower() or "ctrl+e"
+        try:
+            parse_hotkey(new_replace)
+            parse_hotkey(new_popup)
+            parse_hotkey(new_fix)
+        except ValueError as error:
+            from tkinter import messagebox
+            messagebox.showerror(tr("api_settings"), str(error), parent=api_window)
+            return
+
+        hotkeys_changed = (new_replace, new_popup, new_fix) != (HOTKEY_REPLACE, HOTKEY_POPUP, HOTKEY_FIX)
+        HOTKEY_REPLACE, HOTKEY_POPUP, HOTKEY_FIX = new_replace, new_popup, new_fix
+        update_hotkey_labels()
+
         was_ollama_enabled = ollama_enabled
         gemini_enabled = bool(gemini_enabled_checkbox.get())
         claude_enabled = bool(claude_enabled_checkbox.get())
@@ -905,20 +853,24 @@ def show_api_settings():
             ollama_service.start()
         elif was_ollama_enabled and not ollama_enabled:
             ollama_service.stop()
+        if hotkeys_changed:
+            rebind_shortcuts()
         save_settings()
         destroy_toplevel(api_window)
 
     ctk.CTkButton(api_window, text=tr("save"), width=110, height=26, command=save_api_settings).pack(side="bottom", pady=10)
-    api_window.protocol("WM_DELETE_WINDOW", lambda: destroy_toplevel(api_window))
+    api_window.protocol("WM_DELETE_WINDOW", lambda: (rebind_shortcuts(), destroy_toplevel(api_window)))
     refresh_models()
     api_window.after(50, lambda: bring_window_to_front(api_window))
 
+
 base_lang_select.configure(command=select_base_language)
-conversation_context_box.bind("<KeyRelease>", lambda _: save_settings())
+conversation_context_box.bind("<KeyRelease>", lambda _: schedule_save_settings())
 
 tray_icon = None
 tray_thread = None
 exit_requested = False
+
 
 def create_tray_image():
     image = Image.new("RGB", (64, 64), "#1f538d")
@@ -926,13 +878,16 @@ def create_tray_image():
     draw.text((22, 16), "T", fill="white")
     return image
 
+
 def show_main_window(icon=None, item=None):
     app.after(0, lambda: (app.deiconify(), app.lift(), app.focus_force()))
+
 
 def exit_from_tray(icon=None, item=None):
     global exit_requested
     exit_requested = True
     app.after(0, close_app)
+
 
 def run_tray_icon():
     global tray_icon
@@ -943,12 +898,14 @@ def run_tray_icon():
     tray_icon = pystray.Icon("Translator", create_tray_image(), tr("app_title"), menu)
     tray_icon.run()
 
+
 def minimize_to_tray():
     global tray_thread
     app.withdraw()
     if tray_icon is None or not tray_icon.visible:
         tray_thread = threading.Thread(target=run_tray_icon, daemon=True)
         tray_thread.start()
+
 
 def show_close_dialog():
     close_dialog = ctk.CTkToplevel(app)
@@ -994,6 +951,7 @@ def show_close_dialog():
     ).pack(side="left", padx=4)
     close_dialog.protocol("WM_DELETE_WINDOW", lambda: (close_dialog.grab_release(), destroy_toplevel(close_dialog)))
 
+
 def close_app():
     global exit_requested
     if not exit_requested:
@@ -1011,34 +969,46 @@ def close_app():
         tray_icon.stop()
     app.destroy()
 
+
 app.protocol("WM_DELETE_WINDOW", close_app)
 
 status_lbl = ctk.CTkLabel(app, text=tr("status"), font=("Arial", 14), text_color="gray")
 status_lbl.pack(pady=(5, 0))
 
 hotkeys_frame = ctk.CTkFrame(app, fg_color="transparent")
-hotkeys_frame.pack(pady=(8, 0))
+hotkeys_frame.pack(pady=(6, 0))
 
 replace_hotkey_info = ctk.CTkLabel(hotkeys_frame, text=tr("replace_hotkey_info"), font=("Arial", 14))
 replace_hotkey_info.pack(side="left")
 replace_hotkey_value = ctk.CTkLabel(
-    hotkeys_frame, text="Ctrl+Q", font=("Arial", 14, "bold"), text_color="#4da6ff"
+    hotkeys_frame, text=format_hotkey_display(HOTKEY_REPLACE), font=("Arial", 14, "bold"), text_color="#4da6ff"
 )
 replace_hotkey_value.pack(side="left", padx=(5, 0))
 
 popup_hotkey_frame = ctk.CTkFrame(app, fg_color="transparent")
-popup_hotkey_frame.pack(pady=(3, 0))
+popup_hotkey_frame.pack(pady=(2, 0))
 
 popup_hotkey_info = ctk.CTkLabel(popup_hotkey_frame, text=tr("popup_hotkey_info"), font=("Arial", 14))
 popup_hotkey_info.pack(side="left")
 popup_hotkey_value = ctk.CTkLabel(
-    popup_hotkey_frame, text="Ctrl+W", font=("Arial", 14, "bold"), text_color="#4da6ff"
+    popup_hotkey_frame, text=format_hotkey_display(HOTKEY_POPUP), font=("Arial", 14, "bold"), text_color="#4da6ff"
 )
 popup_hotkey_value.pack(side="left", padx=(5, 0))
 
+fix_hotkey_frame = ctk.CTkFrame(app, fg_color="transparent")
+fix_hotkey_frame.pack(pady=(2, 0))
+
+fix_hotkey_info = ctk.CTkLabel(fix_hotkey_frame, text=tr("fix_hotkey_info"), font=("Arial", 14))
+fix_hotkey_info.pack(side="left")
+fix_hotkey_value = ctk.CTkLabel(
+    fix_hotkey_frame, text=format_hotkey_display(HOTKEY_FIX), font=("Arial", 14, "bold"), text_color="#4da6ff"
+)
+fix_hotkey_value.pack(side="left", padx=(5, 0))
+
 debug_window = None
 debug_box = None
-debug_messages = []
+debug_messages = collections.deque(maxlen=500)
+
 
 def destroy_toplevel(window):
     if window and window.winfo_exists():
@@ -1049,6 +1019,7 @@ def destroy_toplevel(window):
         except Exception:
             pass
         window.destroy()
+
 
 def log_debug(message):
     timestamp = time.strftime("%H:%M:%S")
@@ -1062,6 +1033,7 @@ def log_debug(message):
             debug_box.configure(state="disabled")
 
     app.after(0, append_message)
+
 
 def show_debug_window():
     global debug_window, debug_box
@@ -1099,8 +1071,10 @@ def show_debug_window():
         debug_box.configure(state="disabled")
     debug_window.after(50, lambda: bring_window_to_front(debug_window))
 
+
 debug_button = ctk.CTkButton(app, text=tr("debug"), width=130, height=24, command=show_debug_window)
-debug_button.pack(before=status_lbl, pady=(10, 14))
+debug_button.pack(before=status_lbl, pady=(8, 10))
+
 
 # --- 4. API & ФУНКЦІЇ ПЕРЕКЛАДУ ---
 def normalize_model_result(result: str) -> str:
@@ -1132,6 +1106,7 @@ def looks_like_translation_instructions(result: str) -> bool:
     )
     return first_line.startswith(instruction_headers)
 
+
 def source_language_display(language_code):
     language_names = {
         "EN": "English", "UK": "Ukrainian", "RU": "Russian", "PL": "Polish",
@@ -1143,12 +1118,14 @@ def source_language_display(language_code):
     canonical_name = language_names.get(language_code.upper(), language_code)
     return TARGET_LANGUAGE_NAMES[interface_language].get(canonical_name, canonical_name)
 
+
 def set_active_provider(provider, source_language=None):
     provider_label = provider
     if source_language:
         provider_label = f"{provider} • {source_language_display(source_language)}"
     if "bubble_manager" in globals():
         app.after(0, lambda: bubble_manager.set_provider(provider_label))
+
 
 def get_preferred_provider(action_type):
     if action_type == "translate" and ollama_enabled and not ollama_service.in_cooldown:
@@ -1237,12 +1214,24 @@ def run_deepl_action(text: str, target_lang: str) -> str:
         translation = data["translations"][0]
         return translation["detected_source_language"], translation["text"]
 
-    detected_language, result = request_translation(base_code)
-    if detected_language == base_code and target_code != base_code:
-        _, result = request_translation(target_code)
+    # Detect source language locally first to avoid double DeepL API calls when translating from base_language.
+    local_source = None
+    try:
+        local_source = ollama_service.detect_source_language(text)
+    except Exception:
+        local_source = None
+
+    if local_source == base_language and target_code != base_code:
+        detected_language, result = request_translation(target_code)
         destination = target_code
     else:
-        destination = base_code
+        detected_language, result = request_translation(base_code)
+        if local_source is None and detected_language == base_code and target_code != base_code:
+            _, result = request_translation(target_code)
+            destination = target_code
+        else:
+            destination = base_code
+
     set_active_provider("DeepL", detected_language)
     log_debug(f"DeepL: {debug_text('deepl_language', source=detected_language, target=destination)}")
     return result
@@ -1269,7 +1258,10 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
     if action_type == "translate" and ollama_enabled:
         try:
             set_active_provider("Ollama • TranslateGemma")
-            result, source_code = ollama_service.translate(text, base_lang, target_lang)
+            if context:
+                result, source_code = ollama_service.translate(text, base_lang, target_lang, context)
+            else:
+                result, source_code = ollama_service.translate(text, base_lang, target_lang)
             if looks_like_translation_instructions(result):
                 raise ValueError("Ollama returned instructions instead of a translation")
             set_active_provider("Ollama • TranslateGemma", source_code.split("-")[0])
@@ -1393,27 +1385,85 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
             return fallback_result
         return f"Помилка Gemini: {error_text}"
 
-def grab_selected_text_direct() -> str:
+
+def _is_error_response(text: str) -> bool:
+    if not text:
+        return True
+    error_messages = {
+        tr("api_missing"),
+        tr("fix_api_missing"),
+        tr("gemini_cooldown"),
+    }
+    if text in error_messages:
+        return True
+    return text.startswith(("Помилка Gemini:", "Помилка Claude:", "Вичерпано ліміт запитів Gemini."))
+
+
+def run_cached_action(text: str, action_type="translate", target_lang="English", context="") -> str:
+    base_lang = get_selected_base_language()
+    cache_key = (text, action_type, base_lang, target_lang, context)
+    with cache_lock:
+        if cache_key in TRANSLATION_CACHE:
+            TRANSLATION_CACHE.move_to_end(cache_key)
+            cached_result, cached_provider = TRANSLATION_CACHE[cache_key]
+            if cached_provider:
+                set_active_provider(cached_provider)
+            log_debug(f"Cache: {debug_text('cache_hit', action=action_type)}")
+            return cached_result
+
+    result = run_gemini_action(text, action_type, target_lang, context)
+    if not _is_error_response(result):
+        active_provider = getattr(bubble_manager, "loading_provider", "") if "bubble_manager" in globals() else ""
+        with cache_lock:
+            TRANSLATION_CACHE[cache_key] = (result, active_provider)
+            if len(TRANSLATION_CACHE) > MAX_CACHE_ENTRIES:
+                TRANSLATION_CACHE.popitem(last=False)
+    return result
+
+
+def _safe_get_clipboard():
+    try:
+        return pyperclip.paste()
+    except Exception:
+        return None
+
+
+def _safe_set_clipboard(value):
+    if value is None:
+        return
+    try:
+        pyperclip.copy(value)
+    except Exception:
+        pass
+
+
+def grab_selected_text_direct(restore_clipboard=True) -> str:
     time.sleep(0.2)
     pyautogui.keyUp('ctrl')
     pyautogui.keyUp('shift')
     pyautogui.keyUp('alt')
     time.sleep(0.03)
 
+    previous_clipboard = _safe_get_clipboard() if restore_clipboard else None
     clipboard_marker = f"__translator_copy_{time.time_ns()}__"
     pyperclip.copy(clipboard_marker)
     send_ctrl_shortcut('c')
 
-    for _ in range(12):
-        time.sleep(0.05)
-        text = pyperclip.paste()
-        if text != clipboard_marker:
-            selected_text = text.strip()
-            log_debug(f"Буфер: {debug_text('buffer_received', length=len(selected_text))}")
-            return selected_text
+    try:
+        for _ in range(12):
+            time.sleep(0.05)
+            text = pyperclip.paste()
+            if text != clipboard_marker:
+                selected_text = text.strip()
+                log_debug(f"Буфер: {debug_text('buffer_received', length=len(selected_text))}")
+                return selected_text
 
-    log_debug(f"Буфер: {debug_text('buffer_missing')}")
-    return ""
+        log_debug(f"Буфер: {debug_text('buffer_missing')}")
+        return ""
+    finally:
+        if restore_clipboard and previous_clipboard is not None:
+            _safe_set_clipboard(previous_clipboard)
+
 
 # --- 5. МЕНЕДЖЕР КУЛЬКИ ТА МЕНЮ ---
 class AssistantBubble:
@@ -1446,11 +1496,11 @@ class AssistantBubble:
         self.bubble.geometry(f"32x32+{x+12}+{y-18}")
 
         btn = ctk.CTkButton(
-            self.bubble, 
-            text="✦", 
+            self.bubble,
+            text="✦",
             font=("Arial", 16, "bold"),
-            width=32, 
-            height=32, 
+            width=32,
+            height=32,
             corner_radius=16,
             fg_color="#1f538d",
             hover_color="#14375e",
@@ -1603,14 +1653,19 @@ class AssistantBubble:
         buttons_frame.pack(pady=(0, 6))
 
         ctk.CTkButton(
-            buttons_frame, text=tr("copy"), width=95, height=22,
+            buttons_frame, text=tr("copy"), width=90, height=22,
             command=self.copy_result
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=3)
+
+        ctk.CTkButton(
+            buttons_frame, text=tr("replace"), width=130, height=22,
+            command=self.replace_from_popup
+        ).pack(side="left", padx=3)
 
         ctk.CTkButton(
             buttons_frame, text=tr("close"), width=70, height=22,
             fg_color="#D32F2F", hover_color="#B71C1C", command=self.close_result_popup
-        ).pack(side="left", padx=4)
+        ).pack(side="left", padx=3)
 
         self.master.after(300, lambda: self._bind_autoclose(self.result_popup))
 
@@ -1684,6 +1739,33 @@ class AssistantBubble:
         if self.result_popup and self.result_popup.winfo_exists():
             pyperclip.copy(self.res_box.get("1.0", "end-1c"))
 
+    def replace_from_popup(self):
+        if not self.result_popup or not self.result_popup.winfo_exists():
+            return
+        replacement_text = self.res_box.get("1.0", "end-1c").strip()
+        target_hwnd = self.last_target_hwnd
+        self.close_result_popup()
+        if not replacement_text:
+            return
+
+        def paste_worker():
+            previous_clipboard = _safe_get_clipboard()
+            try:
+                pyperclip.copy(replacement_text)
+                if target_hwnd:
+                    try:
+                        win32gui.SetForegroundWindow(target_hwnd)
+                    except Exception:
+                        pass
+                time.sleep(0.08)
+                send_ctrl_shortcut('v')
+                time.sleep(0.12)
+            finally:
+                if previous_clipboard is not None:
+                    _safe_set_clipboard(previous_clipboard)
+
+        threading.Thread(target=paste_worker, daemon=True).start()
+
     def update_result_text(self, text):
         if self.result_popup and self.result_popup.winfo_exists():
             self.res_box.configure(state="normal")
@@ -1702,6 +1784,11 @@ class AssistantBubble:
         if not self.request_lock.acquire(blocking=False):
             log_debug(tr("busy"))
             return
+        try:
+            self.last_target_hwnd = win32gui.GetForegroundWindow()
+        except Exception:
+            self.last_target_hwnd = None
+
         raw_text = text or grab_selected_text_direct()
         if not raw_text:
             self.request_lock.release()
@@ -1710,21 +1797,29 @@ class AssistantBubble:
 
         log_debug(debug_text("popup_started"))
         context = conversation_context_box.get("1.0", "end-1c").strip()
-        
+
         self.show_result_popup(tr("processing"), get_preferred_provider(action_type))
+
         def worker():
             try:
                 target = target_language
-                res = run_gemini_action(raw_text, action_type, target, context)
+                res = run_cached_action(raw_text, action_type, target, context)
                 self.master.after(0, lambda: self.update_result_text(res))
             finally:
                 self.request_lock.release()
+
         threading.Thread(target=worker, daemon=True).start()
 
     def execute_replace_action(self, action_type="translate", text=None, target_hwnd=None):
         if not self.request_lock.acquire(blocking=False):
             log_debug(tr("busy"))
             return
+        if target_hwnd is None:
+            try:
+                target_hwnd = win32gui.GetForegroundWindow()
+            except Exception:
+                target_hwnd = None
+
         raw_text = text or grab_selected_text_direct()
         if not raw_text:
             self.request_lock.release()
@@ -1736,25 +1831,30 @@ class AssistantBubble:
         context = conversation_context_box.get("1.0", "end-1c").strip()
 
         def worker():
+            previous_clipboard = _safe_get_clipboard()
             try:
                 target = target_language
-                res = run_gemini_action(raw_text, action_type, target, context)
+                res = run_cached_action(raw_text, action_type, target, context)
                 pyperclip.copy(res)
 
                 # Повертаємо фокус у вікно, де був текст, перед вставкою
                 if target_hwnd:
                     try:
                         win32gui.SetForegroundWindow(target_hwnd)
-                    except:
+                    except Exception:
                         pass
                 time.sleep(0.08)
                 send_ctrl_shortcut('v')
+                time.sleep(0.12)
                 log_debug(debug_text("replace_done"))
             finally:
+                if previous_clipboard is not None:
+                    _safe_set_clipboard(previous_clipboard)
                 self.hide_loading_indicator()
                 self.request_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
+
 
 bubble_manager = AssistantBubble(app)
 
@@ -1767,10 +1867,12 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 HOTKEY_ID_REPLACE = 1
 HOTKEY_ID_POPUP = 2
+HOTKEY_ID_FIX = 3
 HOTKEY_ID_LANGUAGE_BASE = 10
 hotkey_thread = None
 hotkey_thread_id = None
 hotkey_stop_event = threading.Event()
+
 
 def global_hotkey_loop():
     global hotkey_thread_id
@@ -1780,6 +1882,7 @@ def global_hotkey_loop():
         for hotkey_id, hotkey in (
             (HOTKEY_ID_REPLACE, HOTKEY_REPLACE),
             (HOTKEY_ID_POPUP, HOTKEY_POPUP),
+            (HOTKEY_ID_FIX, HOTKEY_FIX),
         ) + tuple(
             (HOTKEY_ID_LANGUAGE_BASE + index, f"ctrl+alt+{index + 1}")
             for index in range(8)
@@ -1804,6 +1907,8 @@ def global_hotkey_loop():
                     app.after(0, lambda: bubble_manager.execute_replace_action("translate"))
                 elif message.wParam == HOTKEY_ID_POPUP:
                     app.after(0, lambda: bubble_manager.execute_popup_action("translate"))
+                elif message.wParam == HOTKEY_ID_FIX:
+                    app.after(0, lambda: bubble_manager.execute_popup_action("fix"))
                 elif HOTKEY_ID_LANGUAGE_BASE <= message.wParam < HOTKEY_ID_LANGUAGE_BASE + 8:
                     slot_index = message.wParam - HOTKEY_ID_LANGUAGE_BASE
                     app.after(0, lambda index=slot_index: select_target_language_slot(index))
@@ -1815,6 +1920,7 @@ def global_hotkey_loop():
             ctypes.windll.user32.UnregisterHotKey(None, hotkey_id)
         hotkey_thread_id = None
 
+
 def rebind_shortcuts():
     global hotkey_thread
     stop_global_hotkeys()
@@ -1822,14 +1928,15 @@ def rebind_shortcuts():
     hotkey_thread = threading.Thread(target=global_hotkey_loop, daemon=True)
     hotkey_thread.start()
 
+
 def stop_global_hotkeys():
     hotkey_stop_event.set()
     if hotkey_thread_id:
         ctypes.windll.user32.PostThreadMessageW(hotkey_thread_id, WM_QUIT, 0, 0)
 
-rebind_shortcuts()
 
-if ollama_enabled:
-    ollama_service.start()
-
-app.mainloop()
+if __name__ == "__main__":
+    rebind_shortcuts()
+    if ollama_enabled:
+        ollama_service.start()
+    app.mainloop()

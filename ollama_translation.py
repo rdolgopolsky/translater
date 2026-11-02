@@ -57,29 +57,41 @@ class OllamaTranslator:
             raise OllamaUnavailable("Ollama returned an error")
         return result
 
-    def translate(self, text, base_language, target_language):
+    def detect_source_language(self, text):
+        if not text or not text.strip():
+            return None
+        if self._detector is None:
+            self._detector = LanguageDetectorBuilder.from_languages(
+                *(language for _, language in LANGUAGES.values())
+            ).build()
+        detected = self._detector.detect_language_of(text)
+        if detected is None:
+            return None
+        return next((name for name, (_, language) in LANGUAGES.items() if language == detected), None)
+
+    def translate(self, text, base_language, target_language, context=""):
         if self.in_cooldown:
             raise OllamaUnavailable("Ollama is temporarily unavailable; using the backup")
         try:
             if not text.strip() or len(text) > 6000:
                 raise OllamaUnavailable("Text exceeds the local translation limit or is empty")
-            if self._detector is None:
-                self._detector = LanguageDetectorBuilder.from_languages(
-                    *(language for _, language in LANGUAGES.values())
-                ).build()
-            detected = self._detector.detect_language_of(text)
-            if detected is None:
+            source = self.detect_source_language(text)
+            if source is None:
                 raise OllamaUnavailable("Could not determine the source language")
-            source = next(name for name, (_, language) in LANGUAGES.items() if language == detected)
             target = target_language if source == base_language else base_language
             source_code = LANGUAGES[source][0]
             target_code = LANGUAGES[target][0]
             if source == target:
                 return text, source_code
+            context_block = (
+                f"Conversation context (use it to choose the right meaning and tone, do not translate it):\n{context.strip()}\n\n"
+                if context and context.strip() else ""
+            )
             prompt = (
                 f"You are a professional {source} ({source_code}) to {target} ({target_code}) translator. "
                 f"Your goal is to accurately convey the meaning and nuances of the original {source} text "
                 f"while adhering to {target} grammar, vocabulary, and cultural sensitivities.\n"
+                f"{context_block}"
                 f"Produce only the {target} translation, without any additional explanations or commentary. "
                 f"Please translate the following {source} text into {target}:\n\n\n{text}"
             )

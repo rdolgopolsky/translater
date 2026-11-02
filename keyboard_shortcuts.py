@@ -66,10 +66,167 @@ def parse_hotkey(hotkey):
             modifiers |= flags[part]
         else:
             keys.append(part)
-    if len(keys) != 1 or len(keys[0]) != 1 or keys[0] not in "abcdefghijklmnopqrstuvwxyz0123456789":
+    if modifiers == 0 or len(keys) != 1 or len(keys[0]) != 1 or keys[0] not in "abcdefghijklmnopqrstuvwxyz0123456789":
         raise ValueError(f"Непідтримувана клавіша в хоткеї: {hotkey}")
     # Windows VK_A..VK_Z and VK_0..VK_9 do not depend on the input language.
     return modifiers, ord(keys[0].upper())
+
+
+def format_hotkey_display(hotkey):
+    """Format a normalized hotkey string like 'ctrl+shift+q' as 'Ctrl+Shift+Q'."""
+    canonical = {"control": "Ctrl", "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win", "windows": "Win"}
+    parts = [p.strip() for p in (hotkey or "").split("+") if p.strip()]
+    return "+".join(canonical.get(p.lower(), p.upper()) for p in parts)
+
+
+def _extract_event_modifiers(event, is_release=False):
+    """Return active modifier names ('ctrl', 'alt', 'shift', 'win') from a Tk KeyPress event or Win32 state."""
+    mods = []
+    state = getattr(event, "state", 0) or 0
+    keycode = getattr(event, "keycode", 0)
+    # In Windows Tk: 0x0001 = Shift, 0x0004 = Ctrl, 0x20000 = Alt (0x0008 is NumLock!)
+    ctrl = bool(state & 0x0004)
+    alt = bool(state & 0x20000)
+    shift = bool(state & 0x0001)
+    win = False
+    try:
+        import win32api
+        import win32con
+        ctrl = ctrl or (win32api.GetKeyState(win32con.VK_CONTROL) < 0)
+        alt = alt or (win32api.GetKeyState(win32con.VK_MENU) < 0)
+        shift = shift or (win32api.GetKeyState(win32con.VK_SHIFT) < 0)
+        win = (win32api.GetKeyState(win32con.VK_LWIN) < 0) or (win32api.GetKeyState(win32con.VK_RWIN) < 0)
+    except Exception:
+        pass
+    if is_release:
+        if keycode == 17:
+            ctrl = False
+        elif keycode == 18:
+            alt = False
+        elif keycode == 16:
+            shift = False
+        elif keycode in (91, 92):
+            win = False
+    if ctrl:
+        mods.append("ctrl")
+    if alt:
+        mods.append("alt")
+    if shift:
+        mods.append("shift")
+    if win:
+        mods.append("win")
+    return mods
+
+
+def create_hotkey_recorder(parent, initial_hotkey, prompt_text="Натисніть комбінацію...", on_record_start=None, on_record_end=None):
+    """Create a human-friendly button that captures a key combination when clicked."""
+    import customtkinter as ctk
+
+    state = {"value": (initial_hotkey or "ctrl+q").strip().lower(), "recording": False}
+    toplevel = parent.winfo_toplevel()
+
+    btn = ctk.CTkButton(
+        parent,
+        text=format_hotkey_display(state["value"]),
+        height=30,
+        fg_color="#2b2b2b",
+        hover_color="#383838",
+        border_width=1,
+        border_color="#555555",
+        font=("Arial", 13, "bold"),
+    )
+
+    def stop_recording(restore=True, notify_end=True):
+        if not state["recording"]:
+            return
+        state["recording"] = False
+        if getattr(toplevel, "_active_hotkey_recorder", None) is stop_recording:
+            toplevel._active_hotkey_recorder = None
+        if btn.winfo_exists():
+            btn.configure(
+                text=format_hotkey_display(state["value"]),
+                fg_color="#2b2b2b",
+                border_color="#555555",
+                text_color=("gray10", "gray90"),
+            )
+        if notify_end and on_record_end:
+            on_record_end()
+
+    def start_recording():
+        if state["recording"]:
+            stop_recording(restore=True)
+            return
+        prev_stop = getattr(toplevel, "_active_hotkey_recorder", None)
+        if callable(prev_stop):
+            prev_stop(restore=True, notify_end=False)
+        state["recording"] = True
+        toplevel._active_hotkey_recorder = stop_recording
+        if on_record_start:
+            on_record_start()
+        btn.configure(
+            text=prompt_text,
+            fg_color="#1f538d",
+            border_color="#4da6ff",
+            text_color="white",
+        )
+        toplevel.focus_set()
+
+    def on_key_press(event):
+        if not state["recording"]:
+            return None
+        keycode = getattr(event, "keycode", 0)
+        # Escape cancels recording
+        if keycode == 27:
+            stop_recording(restore=True)
+            return "break"
+
+        mods = _extract_event_modifiers(event)
+        # Modifier-only keycodes: Shift(16), Ctrl(17), Alt(18), LWin(91), RWin(92)
+        if keycode in (16, 17, 18, 91, 92):
+            if mods:
+                preview = "+".join(format_hotkey_display(m) for m in mods) + "+..."
+                btn.configure(text=preview)
+            return "break"
+
+        # Physical A-Z (65..90) or 0-9 (48..57)
+        if (65 <= keycode <= 90) or (48 <= keycode <= 57):
+            if not mods:
+                return "break"
+            key_char = chr(keycode).lower()
+            candidate = "+".join(mods + [key_char])
+            try:
+                parse_hotkey(candidate)
+            except ValueError:
+                return "break"
+            state["value"] = candidate
+            stop_recording(restore=False)
+            return "break"
+
+        return "break"
+
+    def on_key_release(event):
+        if not state["recording"]:
+            return None
+        mods = _extract_event_modifiers(event, is_release=True)
+        if mods:
+            btn.configure(text="+".join(format_hotkey_display(m) for m in mods) + "+...")
+        else:
+            btn.configure(text=prompt_text)
+        return "break"
+
+    btn.configure(command=start_recording)
+    toplevel.bind("<KeyPress>", on_key_press, add="+")
+    toplevel.bind("<KeyRelease>", on_key_release, add="+")
+
+    btn.get = lambda: state["value"]
+    btn.set = lambda value: (
+        state.__setitem__("value", (value or "").strip().lower()),
+        btn.configure(text=format_hotkey_display(state["value"])),
+    )
+    btn._handle_key_press = on_key_press
+    btn._start_recording = start_recording
+    btn._stop_recording = stop_recording
+    return btn
 
 
 def enable_edit_shortcuts(widget):
@@ -107,8 +264,8 @@ def enable_edit_shortcuts(widget):
         return
 
     def handle(event):
-        # Leave AltGr and other modified combinations to Tk.
-        if event.state & 0x0008:
+        # Leave AltGr and other modified combinations to Tk (0x20000 is Alt on Windows Tk; 0x0008 is NumLock).
+        if event.state & 0x20000:
             return None
         action = {65: "<<SelectAll>>", 67: "<<Copy>>", 86: "<<Paste>>", 88: "<<Cut>>"}.get(event.keycode)
         if action:

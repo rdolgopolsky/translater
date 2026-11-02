@@ -3,20 +3,54 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from keyboard_shortcuts import create_key_entry, enable_edit_shortcuts, parse_hotkey, paste_text
+from keyboard_shortcuts import (
+    create_hotkey_recorder,
+    create_key_entry,
+    enable_edit_shortcuts,
+    format_hotkey_display,
+    parse_hotkey,
+    paste_text,
+)
 
 
 class HotkeyParsingTests(unittest.TestCase):
     def test_default_shortcuts(self):
         self.assertEqual(parse_hotkey("ctrl+q"), (2, 0x51))
         self.assertEqual(parse_hotkey("ctrl+w"), (2, 0x57))
+        self.assertEqual(parse_hotkey("ctrl+e"), (2, 0x45))
         for digit in range(1, 9):
             self.assertEqual(parse_hotkey(f"ctrl+alt+{digit}"), (3, ord(str(digit))))
 
+    def test_format_hotkey_display(self):
+        self.assertEqual(format_hotkey_display("ctrl+q"), "Ctrl+Q")
+        self.assertEqual(format_hotkey_display("ctrl+shift+t"), "Ctrl+Shift+T")
+        self.assertEqual(format_hotkey_display("alt+win+1"), "Alt+Win+1")
+
     def test_invalid_combinations(self):
-        for shortcut in ("ctrl+", "ctrl+q+w", "ctrl+unknown", "ctrl+й"):
+        for shortcut in ("ctrl+", "ctrl+q+w", "ctrl+unknown", "ctrl+й", "q"):
             with self.subTest(shortcut=shortcut), self.assertRaises(ValueError):
                 parse_hotkey(shortcut)
+
+    def test_hotkey_recorder_captures_combination_and_escape_cancels(self):
+        from types import SimpleNamespace
+        import customtkinter as ctk
+        root = ctk.CTk()
+        try:
+            recorder = create_hotkey_recorder(root, "ctrl+q", prompt_text="Press keys...")
+            recorder._start_recording()
+            # 0x0004 (Ctrl) | 0x0008 (NumLock on Windows Tk) must NOT add Alt
+            recorder._handle_key_press(SimpleNamespace(keycode=87, state=0x000C))  # Ctrl+W with NumLock on
+            self.assertEqual(recorder.get(), "ctrl+w")
+            recorder._start_recording()
+            recorder._handle_key_press(SimpleNamespace(keycode=84, state=0x0005))  # Ctrl+Shift+T
+            self.assertEqual(recorder.get(), "ctrl+shift+t")
+            recorder._start_recording()
+            recorder._handle_key_press(SimpleNamespace(keycode=27, state=0))  # Escape cancels
+            self.assertEqual(recorder.get(), "ctrl+shift+t")
+        finally:
+            for job in root.tk.call("after", "info"):
+                root.tk.call("after", "cancel", job)
+            root.destroy()
 
 
 @unittest.skipUnless(sys.platform == "win32", "Windows keyboard layout regression")
