@@ -25,6 +25,7 @@ import win32con
 import win32gui
 import win32process
 from keyboard_shortcuts import create_key_entry, enable_edit_shortcuts, parse_hotkey, send_ctrl_shortcut
+from ollama_translation import OllamaTranslator, MODEL as OLLAMA_MODEL
 
 # Run with the current user's permissions so Windows can start the app at logon.
 
@@ -240,6 +241,8 @@ HOTKEY_POPUP = saved_popup_hotkey if isinstance(saved_popup_hotkey, str) and sav
 gemini_enabled = saved_settings.get("gemini_enabled", True) is not False
 claude_enabled = saved_settings.get("claude_enabled", True) is not False
 deepl_enabled = saved_settings.get("deepl_enabled", True) is not False
+ollama_enabled = saved_settings.get("ollama_enabled", True) is not False
+ollama_service = OllamaTranslator()
 saved_gemini_model = saved_settings.get("gemini_model", GEMINI_MODEL)
 if not isinstance(saved_gemini_model, str) or saved_gemini_model not in GEMINI_ALLOWED_MODELS:
     saved_gemini_model = GEMINI_MODEL
@@ -636,6 +639,7 @@ def save_settings():
         "gemini_enabled": gemini_enabled,
         "claude_enabled": claude_enabled,
         "deepl_enabled": deepl_enabled,
+        "ollama_enabled": ollama_enabled,
         "replace_hotkey": HOTKEY_REPLACE,
         "popup_hotkey": HOTKEY_POPUP,
     }
@@ -777,6 +781,19 @@ def show_api_settings():
     # when the user closes settings without pressing Save for the API fields.
     startup_checkbox.configure(command=apply_startup_choice)
 
+    ollama_checkbox = ctk.CTkCheckBox(settings_content, text={
+        "uk": "Перекладати локально через Ollama", "ru": "Переводить локально через Ollama",
+        "en": "Translate locally with Ollama",
+    }[interface_language])
+    ollama_checkbox.pack(anchor="w", padx=15, pady=(10, 4))
+    if ollama_enabled:
+        ollama_checkbox.select()
+    ctk.CTkLabel(settings_content, text={
+        "uk": "TranslateGemma 4B — основний перекладач.\nДля резерву увімкніть DeepL і збережіть його ключ.",
+        "ru": "TranslateGemma 4B — основной переводчик.\nДля резерва включите DeepL и сохраните его ключ.",
+        "en": "TranslateGemma 4B is the primary translator.\nEnable DeepL and save its key for automatic backup.",
+    }[interface_language], wraplength=360, justify="left", anchor="w").pack(fill="x", padx=15, pady=(0, 8))
+
     gemini_enabled_checkbox = ctk.CTkCheckBox(settings_content, text=tr("gemini_enabled"))
     gemini_enabled_checkbox.pack(anchor="w", padx=15, pady=(12, 6))
 
@@ -867,6 +884,8 @@ def show_api_settings():
 
     def save_api_settings():
         global gemini_enabled, claude_enabled, deepl_enabled, GEMINI_MODEL, CLAUDE_MODEL, theme_mode, translation_font_size
+        global ollama_enabled
+        was_ollama_enabled = ollama_enabled
         gemini_enabled = bool(gemini_enabled_checkbox.get())
         claude_enabled = bool(claude_enabled_checkbox.get())
         deepl_enabled = bool(deepl_enabled_checkbox.get())
@@ -878,9 +897,14 @@ def show_api_settings():
         translation_font_size = int(font_size_select.get())
         if not apply_startup_choice():
             return
+        ollama_enabled = bool(ollama_checkbox.get())
         GEMINI_MODEL = gemini_model_select.get().strip() or GEMINI_MODEL
         CLAUDE_MODEL = claude_model_select.get().strip() or CLAUDE_MODEL
         configure_api_clients(gemini_entry.get(), claude_entry.get(), deepl_entry.get())
+        if ollama_enabled and not was_ollama_enabled:
+            ollama_service.start()
+        elif was_ollama_enabled and not ollama_enabled:
+            ollama_service.stop()
         save_settings()
         destroy_toplevel(api_window)
 
@@ -982,6 +1006,7 @@ def close_app():
         exit_requested = True
     save_settings()
     stop_global_hotkeys()
+    ollama_service.stop()
     if tray_icon is not None:
         tray_icon.stop()
     app.destroy()
@@ -1126,6 +1151,8 @@ def set_active_provider(provider, source_language=None):
         app.after(0, lambda: bubble_manager.set_provider(provider_label))
 
 def get_preferred_provider(action_type):
+    if action_type == "translate" and ollama_enabled and not ollama_service.in_cooldown:
+        return "Ollama • TranslateGemma"
     if action_type == "translate" and deepl_enabled and DEEPL_API_KEY:
         return "DeepL"
     if client:
@@ -1239,6 +1266,18 @@ def run_gemini_action(text: str, action_type="translate", target_lang="English",
     log_debug(f"API: {debug_text('action_request', action=action_type, text=repr(text[:120]))}")
 
     base_lang = get_selected_base_language()
+    if action_type == "translate" and ollama_enabled:
+        try:
+            set_active_provider("Ollama • TranslateGemma")
+            result, source_code = ollama_service.translate(text, base_lang, target_lang)
+            if looks_like_translation_instructions(result):
+                raise ValueError("Ollama returned instructions instead of a translation")
+            set_active_provider("Ollama • TranslateGemma", source_code.split("-")[0])
+            log_debug(f"Ollama: {OLLAMA_MODEL}; source={source_code}; translation complete")
+            return result
+        except Exception as error:
+            # Do not log the request body, selected text or provider credentials.
+            log_debug(f"Ollama: {type(error).__name__}; trying DeepL backup")
     context_instruction = (
         f"Conversation context:\n{context}\n"
         "Use this context to choose the correct meaning, terminology, and tone.\n"
@@ -1789,5 +1828,8 @@ def stop_global_hotkeys():
         ctypes.windll.user32.PostThreadMessageW(hotkey_thread_id, WM_QUIT, 0, 0)
 
 rebind_shortcuts()
+
+if ollama_enabled:
+    ollama_service.start()
 
 app.mainloop()

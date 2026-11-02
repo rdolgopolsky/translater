@@ -9,3 +9,4 @@ Pillow
 pystray
 pyinstaller
 tzdata
+lingua-language-detector

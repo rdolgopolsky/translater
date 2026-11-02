@@ -5,7 +5,7 @@ $pythonExecutable = Resolve-TranslatorPython -Python $Python
 
 Push-Location $PSScriptRoot
 try {
-    & $pythonExecutable -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, PIL, pystray'
+    & $pythonExecutable -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, PIL, pystray, lingua'
     if ($LASTEXITCODE -ne 0) {
         throw 'Run setup.ps1 to install the project dependencies.'
     }

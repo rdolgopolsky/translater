@@ -7,7 +7,7 @@ Push-Location $PSScriptRoot
 try {
     & $pythonExecutable -m pip check
     if ($LASTEXITCODE -ne 0) { throw 'Dependency check failed. Run setup.ps1.' }
-    & $pythonExecutable -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, win32api, win32con, win32gui, win32process, PIL, pystray, PyInstaller, tzdata'
+    & $pythonExecutable -c 'import anthropic, customtkinter, google.genai, pyautogui, pyperclip, pynput, win32crypt, win32api, win32con, win32gui, win32process, PIL, pystray, PyInstaller, tzdata, lingua'
     if ($LASTEXITCODE -ne 0) {
         throw 'Run setup.ps1 to install the project dependencies.'
     }
